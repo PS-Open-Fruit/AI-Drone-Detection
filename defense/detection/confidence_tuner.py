@@ -38,15 +38,25 @@ def tune_confidence(detector, image_dir: str, ground_truth_csv: str,
     if img_col is None:
         img_col = gt_df.columns[0]
 
+    # Check if an explicit count column exists
+    count_col = None
+    for col in ["num_of_drone", "count", "num_drones", "drone_count", "num_of_drones"]:
+        if col in gt_df.columns:
+            count_col = col
+            break
+
     # Ground truth count per image
     gt_counts = {}
     for p in image_paths:
         name = p.name
-        # Count rows matching either filename or stem
+        # Match either filename or stem
         matches = gt_df[gt_df[img_col].astype(str) == name]
         if len(matches) == 0:
             matches = gt_df[gt_df[img_col].astype(str) == p.stem]
-        gt_counts[p] = len(matches)
+        if count_col and len(matches) > 0:
+            gt_counts[p] = int(matches[count_col].iloc[0])
+        else:
+            gt_counts[p] = len(matches)
 
     # Pre-load images in memory or read on demand
     images = {}

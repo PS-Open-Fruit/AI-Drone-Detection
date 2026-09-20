@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--fusion", type=str, default=None, help="Fusion mode: adaptive, filter, soft, hard, yolo, seg")
     parser.add_argument("--conf", type=float, default=None, help="Confidence threshold")
     parser.add_argument("--debug", type=str, default=None, help="Directory to save 5-stage intermediate debug frames")
+    parser.add_argument("--max-frames", type=int, default=None, help="Maximum number of frames to process")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config")
 
     args = parser.parse_args()
@@ -145,6 +146,10 @@ def main():
             fps_time = now
             lost_tracks = sum(1 for t in tracker.tracks if t.lost_count > 0)
             log("Tracker", f"Frame {frame_idx}/{frame_count} | FPS: {instant_fps:.1f} | Drones: {len(tracks)} | Tracks: {len(tracker.tracks)} ({lost_tracks} lost)")
+
+        if args.max_frames and frame_idx >= args.max_frames:
+            log("Tracker", f"Reached max frames limit: {args.max_frames}")
+            break
 
     cap.release()
     writer.release()
