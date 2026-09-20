@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pt
+*.bin
+*.onnx
+*.ncnn
+models/*.pt
+models/*.bin
+!models/.gitkeep
+!models/README.md
+.venv/
+venv/
+*.mp4
+*.avi
+debug_*/
+TESA 2025 Reorganize/

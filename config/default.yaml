@@ -1,0 +1,65 @@
+# === Camera Station ===
+camera:
+  latitude: 14.305029     # degrees North
+  longitude: 101.173010   # degrees East
+  altitude: 37.2          # meters above MSL
+  station_id: "STATION_ALPHA"
+
+# === Module 1: Detection ===
+detection:
+  # Image processing (morphological)
+  threshold_min: 0
+  threshold_max: 200
+  dilation_kernel_size: 50
+  close_kernel_size: 5
+  min_contour_area: 70
+  max_area_ratio: 0.001
+  dim_factor: 0.3
+
+  # YOLO
+  yolo_model_path: "models/yolo11n-obb.pt"
+  confidence: 0.75
+  device: "cpu"             # "cpu", "cuda", "0", etc.
+
+  # SAHI
+  slice_size: 640
+  overlap_ratio: 0.25
+  nms_threshold: 0.60
+
+# === Module 2: Localization ===
+localization:
+  gbdt_models_dir: "models/"    # expects lat.bin, lon.bin, alt.bin inside
+  # GBDT hyperparameters (for training)
+  n_estimators: 200
+  learning_rate: 0.1
+  max_depth: 5
+  min_samples_split: 5
+  min_samples_leaf: 2
+  subsample: 0.9
+
+  # Fusion
+  fusion_mode: "adaptive"       # adaptive | filter | soft | hard | yolo | seg
+  soft_threshold: 0.25
+  iou_weight: 0.60
+  shape_weight: 0.30
+  motion_weight: 0.10
+  area_ratio_min: 0.00005
+  area_ratio_max: 0.003
+  aspect_ratio_min: 0.4
+  aspect_ratio_max: 3.0
+
+# === Module 3: Tracking ===
+tracking:
+  min_track_confidence: 3       # frames before a track is confirmed
+  track_memory: 30              # frames to keep a lost track alive
+  max_distance_threshold: 100   # pixels for association gating
+
+# === Telemetry ===
+telemetry:
+  api_endpoint: ""              # leave empty to disable API dispatch
+  enabled: false
+
+# === Video Output ===
+output:
+  codec: "mp4v"
+  max_file_size_mb: 200

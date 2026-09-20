@@ -1,0 +1,33 @@
+[project]
+name = "defense"
+version = "1.0.0"
+description = "AI-Based Drone Detection, Localization & Tracking System"
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+    "opencv-python>=4.8.0",
+    "ultralytics>=8.1.0",
+    "sahi>=0.11.0",
+    "scikit-learn>=1.3.0",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+    "joblib>=1.3.0",
+    "requests>=2.31.0",
+    "Pillow>=10.0.0",
+    "pandas>=2.3.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+defense-detect = "scripts.detect_images:main"
+defense-localize = "scripts.localize_drones:main"
+defense-track = "scripts.track_video:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
