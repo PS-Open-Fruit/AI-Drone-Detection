@@ -48,12 +48,20 @@ class VideoTracker:
         # 1. Detection
         seg_candidates = []
         binary_mask = None
+        clean_frame = frame
         if self.image_processor is not None:
             binary_mask, seg_candidates = self.image_processor.process(frame)
+            clean_frame = self.image_processor.clean_image(frame, seg_candidates)
 
         yolo_detections = []
         if self.detector is not None:
-            yolo_detections = self.detector.detect(frame)
+            yolo_detections = self.detector.detect(clean_frame)
+            ih, iw = frame.shape[:2]
+            yolo_detections = [
+                d for d in yolo_detections
+                if not (d["center_y"] < 120 and d["center_x"] > 0.60 * iw)
+                and not (d["center_y"] > 0.88 * ih)
+            ]
 
         # 2. Candidate fusion
         prev_centroids = [t.centroid for t in self.tracks if not t.is_dead]

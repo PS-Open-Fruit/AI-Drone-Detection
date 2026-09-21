@@ -20,9 +20,17 @@ detection:
   max_area_ratio: 0.01
   dim_factor: 0.1
 
+  # Clutter & false-alarm suppression
+  suppress_timestamp: true
+  timestamp_y_max: 120
+  timestamp_x_ratio: 0.60
+  suppress_foliage: true
+  foliage_y_ratio: 0.88
+  roi_padding: 25
+
   # YOLO
   yolo_model_path: "models/yolo11n-obb.pt"
-  confidence: 0.25
+  confidence: 0.50
   device: "cpu"             # "cpu", "cuda", "0", etc.
 
   # SAHI

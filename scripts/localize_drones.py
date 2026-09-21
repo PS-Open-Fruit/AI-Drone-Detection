@@ -68,7 +68,16 @@ def main():
             continue
 
         _, seg_candidates = image_processor.process(img)
-        yolo_dets = detector.detect(img)
+        clean_img = image_processor.clean_image(img, seg_candidates)
+        yolo_dets = detector.detect(clean_img)
+
+        ih, iw = img.shape[:2]
+        yolo_dets = [
+            d for d in yolo_dets
+            if not (d["center_y"] < 120 and d["center_x"] > 0.60 * iw)
+            and not (d["center_y"] > 0.88 * ih)
+        ]
+
         fused = fusion_engine.fuse(seg_candidates, yolo_dets, image_shape=img.shape[:2])
 
         if fused:

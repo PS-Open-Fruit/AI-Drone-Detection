@@ -4,7 +4,7 @@ import time
 import pandas as pd
 import cv2
 from defense.config import load_config, get_detection_config
-from defense.detection import YoloDetector, SahiDetector
+from defense.detection import YoloDetector, SahiDetector, ImageProcessor
 from defense.utils.logger import log
 
 def main():
@@ -25,7 +25,7 @@ def main():
     det_cfg = get_detection_config(cfg)
 
     model_path = args.model or det_cfg.get("yolo_model_path", "models/yolo11n-obb.pt")
-    confidence = args.conf if args.conf is not None else float(det_cfg.get("confidence", 0.75))
+    confidence = args.conf if args.conf is not None else float(det_cfg.get("confidence", 0.50))
     device = args.device or det_cfg.get("device", "cpu")
 
     test_dir = Path(args.test_dir)
@@ -40,6 +40,8 @@ def main():
     log("Defense", f"Model: {model_path}")
     log("Defense", f"Input: {test_dir} ({len(image_paths)} images found)")
     log("Defense", f"Confidence: {confidence}, Device: {device}, Mode: {'SAHI' if args.use_sahi else 'Standard YOLO'}")
+
+    image_processor = ImageProcessor(det_cfg)
 
     if args.use_sahi:
         slice_size = args.slice or det_cfg.get("slice_size", 640)
@@ -59,14 +61,22 @@ def main():
     records = []
 
     for idx, img_path in enumerate(image_paths, 1):
-        if args.use_sahi:
-            dets = detector.detect(str(img_path))
-        else:
-            img = cv2.imread(str(img_path))
-            if img is None:
-                log("Detection", f"❌ Failed to process {img_path.name}: image could not be loaded")
-                continue
-            dets = detector.detect(img)
+        img = cv2.imread(str(img_path))
+        if img is None:
+            log("Detection", f"❌ Failed to process {img_path.name}: image could not be loaded")
+            continue
+
+        mask, cands = image_processor.process(img)
+        clean_img = image_processor.clean_image(img, cands)
+        dets = detector.detect(clean_img)
+
+        # Spatial filter: exclude detections in camera timestamp and foliage exclusion zones
+        ih, iw = img.shape[:2]
+        dets = [
+            d for d in dets
+            if not (d["center_y"] < 120 and d["center_x"] > 0.60 * iw)
+            and not (d["center_y"] > 0.88 * ih)
+        ]
 
         log("Detection", f"Processing image {idx}/{len(image_paths)}: {img_path.name} → {len(dets)} drones")
 

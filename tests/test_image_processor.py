@@ -17,6 +17,8 @@ def test_image_processor_synthetic():
         "close_kernel_size": 3,
         "min_contour_area": 0,
         "max_area_ratio": 0.5,
+        "suppress_timestamp": False,
+        "suppress_foliage": False,
     })
 
     mask, candidates = processor.process(img)
@@ -50,6 +52,8 @@ def test_image_processor_archive_regression():
         "close_kernel_size": 5,
         "min_contour_area": 0,
         "max_area_ratio": 0.01,
+        "suppress_timestamp": False,
+        "suppress_foliage": False,
     })
 
     mask, candidates = processor.process(raw)
@@ -63,6 +67,50 @@ def test_image_processor_archive_regression():
     x, y, w, h = candidates[0]
     assert 750 <= x <= 780
     assert 260 <= y <= 290
+
+def test_image_processor_timestamp_and_foliage_suppression():
+    # 1080x1920 frame
+    img = np.full((1080, 1920, 3), 200, dtype=np.uint8)
+    # Simulate dark timestamp digits in top right (y=50..70, x=1500..1600)
+    img[50:70, 1500:1600] = 30
+    # Simulate dark foliage in bottom grass (y=1000..1020, x=100..150)
+    img[1000:1020, 100:150] = 30
+    # Simulate real drone in center sky (y=400..420, x=900..920)
+    img[400:420, 900:920] = 30
+
+    processor = ImageProcessor({
+        "threshold_min": 60,
+        "threshold_max": 255,
+        "dilation_kernel_size": 15,
+        "erosion_kernel_size": 5,
+        "close_kernel_size": 3,
+        "min_contour_area": 0,
+        "max_area_ratio": 0.01,
+        "suppress_timestamp": True,
+        "timestamp_y_max": 120,
+        "timestamp_x_ratio": 0.60,
+        "suppress_foliage": True,
+        "foliage_y_ratio": 0.88,
+    })
+
+    mask, candidates = processor.process(img)
+    # Should only detect the drone at (900, 400), timestamp and bottom foliage must be suppressed
+    assert len(candidates) == 1
+    cx = candidates[0][0] + candidates[0][2] // 2
+    cy = candidates[0][1] + candidates[0][3] // 2
+    assert abs(cx - 910) < 15
+    assert abs(cy - 410) < 15
+
+def test_image_processor_clean_image():
+    img = np.full((200, 200, 3), 200, dtype=np.uint8)
+    processor = ImageProcessor({"dim_factor": 0.1, "roi_padding": 10})
+    candidates = [(90, 90, 20, 20)]
+
+    cleaned = processor.clean_image(img, candidates=candidates)
+    # Outside candidate ROI (e.g. at (10, 10)): dimmed to ~20
+    assert abs(int(cleaned[10, 10, 0]) - 20) <= 2
+    # Inside candidate ROI (e.g. at (100, 100)): full intensity 200
+    assert cleaned[100, 100, 0] == 200
 
 def test_image_processor_dim_background():
     img = np.full((100, 100, 3), 200, dtype=np.uint8)

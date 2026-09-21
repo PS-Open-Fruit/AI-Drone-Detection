@@ -5,13 +5,14 @@ from defense.utils.logger import log
 class ImageProcessor:
     """Classical computer vision preprocessing pipeline for small aerial target isolation.
 
-    Implements the exact 3-stage morphological pipeline from the TESA archive:
+    Implements:
     1. Grayscale conversion & inRange binarization (sky 60..255 -> inverted to white drone blob)
     2. Rectangular dilation (50x50) to bridge rotor and airframe segments
     3. Rectangular erosion (9x9) to suppress spurious single-pixel noise
     4. Morphological closing (5x5) to eliminate pinholes and smooth boundaries
-    5. Inverted mask output (255 background, 0 target object)
+    5. OSD Datetime Banner & Foliage/Ground Boundary suppression
     6. Area-gated contour detection (0 to 1% frame area)
+    7. Cleaned / Highlighted image generation (dimming background clutter before YOLO/SAHI)
     """
 
     def __init__(self, config: dict = None):
@@ -28,23 +29,80 @@ class ImageProcessor:
         self.max_area_ratio = float(cfg.get("max_area_ratio", 0.01))
         self.dim_factor = float(cfg.get("dim_factor", 0.1))
 
+        # Clutter & false-alarm suppression settings
+        self.suppress_timestamp = bool(cfg.get("suppress_timestamp", True))
+        self.timestamp_y_max = int(cfg.get("timestamp_y_max", 120))
+        self.timestamp_x_ratio = float(cfg.get("timestamp_x_ratio", 0.60))
+        self.suppress_foliage = bool(cfg.get("suppress_foliage", True))
+        self.foliage_y_ratio = float(cfg.get("foliage_y_ratio", 0.88))
+        self.roi_padding = int(cfg.get("roi_padding", 25))
+
     def process(self, image: np.ndarray) -> tuple[np.ndarray, list[tuple]]:
         """
         Execute full preprocessing pipeline.
         Returns:
             (binary_mask, candidate_boxes) where:
-                binary_mask: uint8 image (255 background, 0 target object) matching stage 2 asset
+                binary_mask: uint8 image (255 background, 0 target object)
                 candidate_boxes: list of (x, y, w, h) bounding boxes
         """
         gray = self._to_grayscale(image)
         binary = self._binarize(gray)
         dilated, eroded, closed = self._morphological_filter(binary)
+
+        h, w = image.shape[:2]
+
+        # Suppress camera OSD timestamp banner (top-right text)
+        if self.suppress_timestamp:
+            closed[0:self.timestamp_y_max, int(w * self.timestamp_x_ratio):w] = 0
+
+        # Suppress lower foliage / ground border clutter
+        if self.suppress_foliage:
+            closed[int(h * self.foliage_y_ratio):h, :] = 0
+
         # binary_mask has white background (255) and black objects (0)
         binary_mask = cv2.bitwise_not(closed)
         contours = self._find_contours(closed)
         candidates = self._filter_contours(contours, image.shape)
+
         log("ImageProc", f"  Morphological filter: {len(candidates)} candidates after area gating")
         return binary_mask, candidates
+
+    def clean_image(self, image: np.ndarray, candidates: list[tuple] = None, padding: int = None) -> np.ndarray:
+        """
+        Produce a cleaned / highlighted mask image for deep learning inference (YOLO / SAHI).
+        Candidate drone regions are preserved at full native intensity (+ padding for context),
+        while all non-target regions (sky, trees, foliage, OSD text) are dimmed down to dim_factor.
+        """
+        if candidates is None:
+            _, candidates = self.process(image)
+
+        pad = padding if padding is not None else self.roi_padding
+        h, w = image.shape[:2]
+
+        roi_mask = np.zeros((h, w), dtype=np.uint8)
+        for (x, y, bw, bh) in candidates:
+            # Skip any candidate that overlaps timestamp banner or foliage border
+            if self.suppress_timestamp and y < self.timestamp_y_max and (x + bw) > int(w * self.timestamp_x_ratio):
+                continue
+            if self.suppress_foliage and (y + bh) > int(h * self.foliage_y_ratio):
+                continue
+
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(w, x + bw + pad)
+            y2 = min(h, y + bh + pad)
+            roi_mask[y1:y2, x1:x2] = 255
+
+        # Unconditionally suppress timestamp banner and lower foliage in ROI mask
+        if self.suppress_timestamp:
+            roi_mask[0:self.timestamp_y_max, int(w * self.timestamp_x_ratio):w] = 0
+        if self.suppress_foliage:
+            roi_mask[int(h * self.foliage_y_ratio):h, :] = 0
+
+        bg_mask = cv2.bitwise_not(roi_mask)
+        bg_mask_3ch = cv2.cvtColor(bg_mask, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
+        cleaned = image.astype(np.float32) * (1.0 - bg_mask_3ch * (1.0 - self.dim_factor))
+        return np.clip(cleaned, 0, 255).astype(np.uint8)
 
     def _to_grayscale(self, image: np.ndarray) -> np.ndarray:
         return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -76,17 +134,32 @@ class ImageProcessor:
         return contours
 
     def _filter_contours(self, contours: list, image_shape: tuple) -> list[tuple]:
+        _, candidates = self._filter_contours_and_boxes(contours, image_shape)
+        return candidates
+
+    def _filter_contours_and_boxes(self, contours: list, image_shape: tuple) -> tuple[list, list[tuple]]:
         ih, iw = image_shape[:2]
         total_area = float(ih * iw)
         max_area = total_area * self.max_area_ratio
+        valid_contours = []
         candidates = []
         for contour in contours:
             area = cv2.contourArea(contour)
             if area < self.min_contour_area or area > max_area:
                 continue
             x, y, w, h = cv2.boundingRect(contour)
+
+            # Spatial exclusion check: timestamp banner (top-right)
+            if self.suppress_timestamp and y < self.timestamp_y_max and (x + w) > int(iw * self.timestamp_x_ratio):
+                continue
+
+            # Spatial exclusion check: ground / lower foliage border
+            if self.suppress_foliage and (y + h) > int(ih * self.foliage_y_ratio):
+                continue
+
+            valid_contours.append(contour)
             candidates.append((int(x), int(y), int(w), int(h)))
-        return candidates
+        return valid_contours, candidates
 
     def dim_background(self, image: np.ndarray, binary_mask: np.ndarray) -> np.ndarray:
         """
