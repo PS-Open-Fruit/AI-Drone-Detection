@@ -7,18 +7,22 @@ camera:
 
 # === Module 1: Detection ===
 detection:
-  # Image processing (morphological)
-  threshold_min: 0
-  threshold_max: 200
+  # Image processing (morphological) - verified against TESA archive
+  threshold_min: 60
+  threshold_max: 255
   dilation_kernel_size: 50
+  dilation_iterations: 1
+  erosion_kernel_size: 9
+  erosion_iterations: 1
   close_kernel_size: 5
-  min_contour_area: 70
-  max_area_ratio: 0.001
-  dim_factor: 0.3
+  close_iterations: 1
+  min_contour_area: 0
+  max_area_ratio: 0.01
+  dim_factor: 0.1
 
   # YOLO
   yolo_model_path: "models/yolo11n-obb.pt"
-  confidence: 0.75
+  confidence: 0.25
   device: "cpu"             # "cpu", "cuda", "0", etc.
 
   # SAHI
@@ -44,7 +48,7 @@ localization:
   shape_weight: 0.30
   motion_weight: 0.10
   area_ratio_min: 0.00005
-  area_ratio_max: 0.003
+  area_ratio_max: 0.01
   aspect_ratio_min: 0.4
   aspect_ratio_max: 3.0
 
