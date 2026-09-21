@@ -132,11 +132,78 @@ def main():
 
         # Debug frame saving
         if debug_dirs:
+            # Stage 1: Original frame
             cv2.imwrite(str(debug_dirs["1_original"] / f"frame_{frame_idx:06d}.jpg"), frame)
-            # Binary mask
-            mask, _ = image_processor.process(frame)
+
+            # Stage 2: Binary mask (white background, black objects)
+            mask = tracker.last_binary_mask if tracker.last_binary_mask is not None else image_processor.process(frame)[0]
             cv2.imwrite(str(debug_dirs["2_binary_mask"] / f"frame_{frame_idx:06d}.jpg"), mask)
-            # Annotations
+
+            # Stage 3: Detections (SEG in blue, YOLO in orange, Fused in green)
+            detection_frame = frame.copy()
+            for y_det in tracker.last_yolo_detections:
+                yx = int(round(y_det["center_x"] - y_det["width"] / 2.0))
+                yy = int(round(y_det["center_y"] - y_det["height"] / 2.0))
+                yw = int(round(y_det["width"]))
+                yh = int(round(y_det["height"]))
+                y_conf = y_det.get("confidence", 0.0)
+                cv2.rectangle(detection_frame, (yx, yy), (yx + yw, yy + yh), (0, 165, 255), 2)
+                cv2.putText(detection_frame, f"YOLO {y_conf:.2f}", (yx, max(12, yy - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+
+            for (sx, sy, sw, sh) in tracker.last_seg_candidates:
+                cv2.rectangle(detection_frame, (sx, sy), (sx + sw, sy + sh), (255, 0, 0), 2)
+                cv2.putText(detection_frame, "SEG", (sx, max(12, sy - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+
+            for i, f_det in enumerate(tracker.last_fused_detections):
+                fx = int(round(f_det["center_x"] - f_det["width"] / 2.0))
+                fy = int(round(f_det["center_y"] - f_det["height"] / 2.0))
+                fw = int(round(f_det["width"]))
+                fh = int(round(f_det["height"]))
+                f_conf = f_det.get("confidence", 0.0)
+                cv2.rectangle(detection_frame, (fx, fy), (fx + fw, fy + fh), (0, 255, 0), 3)
+                label = f"FUSED-{i+1}"
+                if f_conf > 0:
+                    label += f" {f_conf:.2f}"
+                cv2.putText(detection_frame, label, (fx, max(14, fy - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            cv2.putText(detection_frame, f"Fusion: {fusion_mode.upper()}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(detection_frame,
+                        f"SEG: {len(tracker.last_seg_candidates)} | YOLO: {len(tracker.last_yolo_detections)} | FUSED: {len(tracker.last_fused_detections)}",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.imwrite(str(debug_dirs["3_detections"] / f"frame_{frame_idx:06d}.jpg"), detection_frame)
+
+            # Stage 4: Tracking status
+            tracking_frame = frame.copy()
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            for trk in tracker.tracks:
+                tx, ty, tw, th = trk.bbox
+                if trk.confirmed:
+                    t_color = trk.color
+                    status_lbl = "CONFIRMED"
+                else:
+                    t_color = (128, 128, 128)
+                    status_lbl = "UNCONFIRMED"
+
+                cv2.rectangle(tracking_frame, (tx, ty), (tx + tw, ty + th), t_color, 2)
+                cx, cy = int(round(trk.centroid[0])), int(round(trk.centroid[1]))
+                cv2.circle(tracking_frame, (cx, cy), 3, t_color, -1)
+                info_y = max(15, ty - 10)
+                cv2.putText(tracking_frame, f"ID:{trk.track_id} {status_lbl}",
+                            (tx, info_y), font, 0.4, t_color, 1)
+                cv2.putText(tracking_frame, f"Frames:{trk.frames_tracked} Lost:{trk.lost_count}",
+                            (tx, max(28, info_y - 15)), font, 0.3, t_color, 1)
+
+            cv2.putText(tracking_frame, f"Active Tracks: {len(tracker.tracks)}",
+                        (10, 30), font, 0.7, (255, 255, 255), 2)
+            cv2.putText(tracking_frame, f"Confirmed: {len([t for t in tracker.tracks if t.confirmed])}",
+                        (10, 60), font, 0.7, (0, 255, 0), 2)
+            cv2.imwrite(str(debug_dirs["4_tracking"] / f"frame_{frame_idx:06d}.jpg"), tracking_frame)
+
+            # Stage 5: Final annotated frame
             cv2.imwrite(str(debug_dirs["5_final_annotated"] / f"frame_{frame_idx:06d}.jpg"), annotated)
 
         # Print progress regularly

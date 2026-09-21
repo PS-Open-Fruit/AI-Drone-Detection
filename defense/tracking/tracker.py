@@ -30,6 +30,12 @@ class VideoTracker:
         self.next_id: int = 1
         self.frame_count: int = 0
 
+        # Debug intermediate state cache
+        self.last_binary_mask = None
+        self.last_seg_candidates = []
+        self.last_yolo_detections = []
+        self.last_fused_detections = []
+
         log("Tracker", f"Initialized: max_dist={self.max_distance}px, "
                        f"confirm={self.min_confirm} frames, memory={self.track_memory} frames")
 
@@ -41,8 +47,9 @@ class VideoTracker:
 
         # 1. Detection
         seg_candidates = []
+        binary_mask = None
         if self.image_processor is not None:
-            _, seg_candidates = self.image_processor.process(frame)
+            binary_mask, seg_candidates = self.image_processor.process(frame)
 
         yolo_detections = []
         if self.detector is not None:
@@ -57,6 +64,12 @@ class VideoTracker:
             prev_centroids=prev_centroids,
             image_shape=frame.shape[:2]
         )
+
+        # Cache debug state
+        self.last_binary_mask = binary_mask
+        self.last_seg_candidates = seg_candidates
+        self.last_yolo_detections = yolo_detections
+        self.last_fused_detections = detections
 
         # 3. Association
         matches, unmatched_detections, unmatched_tracks = self._associate(detections, self.tracks)
