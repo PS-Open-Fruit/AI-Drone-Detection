@@ -96,7 +96,7 @@ class VideoTracker:
             if not was_confirmed and track.confirmed:
                 log("Tracker", f"✅ Track ID={track.track_id} confirmed ({track.min_confirm_frames} consecutive frames)")
 
-        # 5. Create new tracks for unmatched detections
+        # 5. Create new tracks for unmatched detections (with proximity gating to prevent duplicates)
         for d_idx in unmatched_detections:
             det = detections[d_idx]
             cx = det["center_x"]
@@ -105,6 +105,24 @@ class VideoTracker:
             h = det["height"]
             bbox = (int(round(cx - w / 2.0)), int(round(cy - h / 2.0)), int(round(w)), int(round(h)))
             conf = det.get("confidence", 0.8)
+
+            # Suppress track creation if too close to any existing track or newly added track
+            too_close = False
+            for t in self.tracks:
+                if t.is_dead:
+                    continue
+                tx, ty = t.centroid
+                dist = math.sqrt((cx - tx) ** 2 + (cy - ty) ** 2)
+                iou = self._compute_bbox_iou(bbox, t.bbox)
+                max_dim = max(w, h, t.bbox[2], t.bbox[3])
+                if iou >= 0.10 or dist <= max(50.0, max_dim * 0.70):
+                    too_close = True
+                    log("Tracker", f"🚫 Suppressed duplicate track creation at ({cx}, {cy}) near track ID={t.track_id} (dist={dist:.1f}px)")
+                    break
+
+            if too_close:
+                continue
+
             new_track = DroneTrack(
                 track_id=self.next_id,
                 bbox=bbox,
@@ -131,7 +149,10 @@ class VideoTracker:
                 alive_tracks.append(track)
         self.tracks = alive_tracks
 
-        # 8. Localization on confirmed tracks
+        # 8. Merge co-located tracks in the same drone area
+        self._merge_colocated_tracks()
+
+        # 9. Localization on confirmed tracks
         for track in self.tracks:
             if track.confirmed and self.localizer is not None:
                 features = encode_features(track.bbox, frame.shape[:2])
@@ -141,8 +162,55 @@ class VideoTracker:
                 track.alt = float(pred["alt"])
                 log("Localization", f"📍 Track ID={track.track_id}: lat={track.lat:.5f}, lon={track.lon:.5f}, alt={track.alt:.2f}m")
 
-        # 9. Return confirmed tracks
+        # 10. Return confirmed tracks
         return [t for t in self.tracks if t.confirmed]
+
+    def _merge_colocated_tracks(self):
+        """Merge tracks that represent the same physical drone in the same area."""
+        if len(self.tracks) < 2:
+            return
+
+        # Sort: confirmed tracks first, then more frames tracked, then lower lost count
+        sorted_tracks = sorted(
+            self.tracks,
+            key=lambda t: (t.confirmed, t.frames_tracked, -t.lost_count),
+            reverse=True
+        )
+        kept_tracks = []
+        for t in sorted_tracks:
+            if t.is_dead:
+                continue
+            duplicate = False
+            tx, ty = t.centroid
+            for k in kept_tracks:
+                kx, ky = k.centroid
+                dist = math.sqrt((tx - kx) ** 2 + (ty - ky) ** 2)
+                iou = self._compute_bbox_iou(t.bbox, k.bbox)
+                tw, th = t.bbox[2], t.bbox[3]
+                kw, kh = k.bbox[2], k.bbox[3]
+                max_dim = max(tw, th, kw, kh)
+                if iou >= 0.10 or dist <= max(50.0, max_dim * 0.70):
+                    duplicate = True
+                    k.frames_tracked = max(k.frames_tracked, t.frames_tracked)
+                    k.confirmed = k.confirmed or t.confirmed
+                    k.confidence = max(k.confidence, t.confidence)
+                    log("Tracker", f"🔀 Merged duplicate track ID={t.track_id} into primary track ID={k.track_id} (dist={dist:.1f}px, iou={iou:.2f})")
+                    break
+            if not duplicate:
+                kept_tracks.append(t)
+        self.tracks = kept_tracks
+
+    @staticmethod
+    def _compute_bbox_iou(box1: tuple, box2: tuple) -> float:
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+        xa = max(x1, x2)
+        ya = max(y1, y2)
+        xb = min(x1 + w1, x2 + w2)
+        yb = min(y1 + h1, y2 + h2)
+        inter = max(0, xb - xa) * max(0, yb - ya)
+        union = (w1 * h1) + (w2 * h2) - inter
+        return float(inter / union) if union > 0 else 0.0
 
     def _associate(self, detections: list, tracks: list) -> tuple[dict, list, list]:
         """

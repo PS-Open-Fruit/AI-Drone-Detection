@@ -32,35 +32,66 @@ class FusionEngine:
         score = self.iou_weight * t_iou + self.shape_weight * t_shape + self.motion_weight * t_motion
         return float(score)
 
+    def _is_duplicate(self, box1, box2, iou_thresh: float = 0.15, dist_thresh: float = 60.0) -> bool:
+        """Determine if two bounding boxes correspond to the same physical drone."""
+        if self._compute_iou(box1, box2) >= iou_thresh:
+            return True
+
+        c1x, c1y = self._get_centroid(box1)
+        c2x, c2y = self._get_centroid(box2)
+        dist = math.sqrt((c1x - c2x) ** 2 + (c1y - c2y) ** 2)
+
+        x1, y1, w1, h1 = self._to_xywh(box1)
+        x2, y2, w2, h2 = self._to_xywh(box2)
+        max_dim = max(w1, h1, w2, h2)
+
+        if dist <= max(dist_thresh, max_dim * 0.70):
+            return True
+
+        # Center inclusion check (one center inside the other bounding box)
+        if (x2 <= c1x <= x2 + w2 and y2 <= c1y <= y2 + h2) or (x1 <= c2x <= x1 + w1 and y1 <= c2y <= y1 + h1):
+            return True
+
+        return False
+
     def fuse(self, seg_candidates: list, yolo_detections: list, active_tracks: list = None,
              prev_centroids: list = None, image_shape: tuple = (720, 1280)) -> list[dict]:
         """
-        Apply the configured fusion mode to merge candidates.
-        Returns a list of accepted detection dicts.
+        Apply the configured fusion mode to merge candidates with strict single-drone deduplication.
+        Returns a list of accepted detection dicts (guaranteeing one detection per physical drone).
         """
-        accepted = []
+        # Start with YOLO detections as primary (higher spatial precision)
+        accepted = [dict(d) for d in yolo_detections]
 
         if self.mode == "yolo":
-            accepted = list(yolo_detections)
+            pass
         elif self.mode == "seg":
             accepted = [self._to_det_dict(c) for c in seg_candidates]
         elif self.mode == "soft":
-            accepted = list(yolo_detections)
             for c in seg_candidates:
                 score = self.score_candidate(c, yolo_detections, prev_centroids, image_shape)
                 if score >= self.soft_threshold:
-                    # check overlap with existing accepted
-                    if not any(self._compute_iou(c, acc) > 0.40 for acc in accepted):
+                    matched = False
+                    for acc in accepted:
+                        if self._is_duplicate(c, acc):
+                            acc["confidence"] = min(1.0, acc.get("confidence", 0.5) + 0.10)
+                            matched = True
+                            break
+                    if not matched:
                         accepted.append(self._to_det_dict(c, conf=score))
         elif self.mode == "hard":
-            accepted = list(yolo_detections)
             for c in seg_candidates:
                 max_iou = max((self._compute_iou(c, det) for det in yolo_detections), default=0.0)
                 if max_iou >= 0.20:
-                    if not any(self._compute_iou(c, acc) > 0.40 for acc in accepted):
+                    matched = False
+                    for acc in accepted:
+                        if self._is_duplicate(c, acc):
+                            acc["confidence"] = max(acc.get("confidence", 0.75), 0.85)
+                            matched = True
+                            break
+                    if not matched:
                         accepted.append(self._to_det_dict(c, conf=0.75))
         elif self.mode == "filter":
-            accepted = list(yolo_detections)
             ih, iw = image_shape[:2]
             diag = math.sqrt(iw * iw + ih * ih)
             for c in seg_candidates:
@@ -70,14 +101,19 @@ class FusionEngine:
                     cx, cy = self._get_centroid(c)
                     for t in active_tracks:
                         tx, ty = t.centroid if hasattr(t, "centroid") else (t["center_x"], t["center_y"])
-                        if math.sqrt((cx - tx)**2 + (cy - ty)**2) <= 0.10 * diag:
+                        if math.sqrt((cx - tx) ** 2 + (cy - ty) ** 2) <= 0.10 * diag:
                             is_near_track = True
                             break
                 if max_iou >= 0.20 or is_near_track:
-                    if not any(self._compute_iou(c, acc) > 0.40 for acc in accepted):
+                    matched = False
+                    for acc in accepted:
+                        if self._is_duplicate(c, acc):
+                            acc["confidence"] = max(acc.get("confidence", 0.70), 0.80)
+                            matched = True
+                            break
+                    if not matched:
                         accepted.append(self._to_det_dict(c, conf=0.70))
         elif self.mode == "adaptive":
-            accepted = list(yolo_detections)
             ih, iw = image_shape[:2]
             diag = math.sqrt(iw * iw + ih * ih)
 
@@ -90,19 +126,32 @@ class FusionEngine:
                         confirmed = getattr(t, "confirmed", True)
                         if confirmed:
                             tx, ty = t.centroid if hasattr(t, "centroid") else (t["center_x"], t["center_y"])
-                            if math.sqrt((cx - tx)**2 + (cy - ty)**2) <= 0.10 * diag:
+                            if math.sqrt((cx - tx) ** 2 + (cy - ty) ** 2) <= 0.10 * diag:
                                 boost = 0.50
                                 break
                 final_score = min(1.0, base_score + boost)
                 if final_score >= self.soft_threshold:
-                    # Avoid duplicate bounding box with existing YOLO detection
-                    if not any(self._compute_iou(c, acc) > 0.40 for acc in accepted):
+                    matched = False
+                    for acc in accepted:
+                        if self._is_duplicate(c, acc):
+                            # Same physical drone: boost YOLO confidence, do not add duplicate box
+                            acc["confidence"] = min(1.0, acc.get("confidence", 0.5) + 0.10)
+                            matched = True
+                            break
+                    if not matched:
                         accepted.append(self._to_det_dict(c, conf=final_score))
         else:
-            accepted = list(yolo_detections)
+            pass
 
-        log("Fusion", f"  {self.mode}: {len(seg_candidates)} seg + {len(yolo_detections)} yolo → {len(accepted)} accepted")
-        return accepted
+        # Final Non-Maximum Suppression (NMS) pass to guarantee zero duplicates in one drone area
+        deduplicated = []
+        sorted_accepted = sorted(accepted, key=lambda x: x.get("confidence", 0.0), reverse=True)
+        for det in sorted_accepted:
+            if not any(self._is_duplicate(det, kept) for kept in deduplicated):
+                deduplicated.append(det)
+
+        log("Fusion", f"  {self.mode}: {len(seg_candidates)} seg + {len(yolo_detections)} yolo → {len(deduplicated)} accepted")
+        return deduplicated
 
     def _to_xywh(self, box) -> tuple[int, int, int, int]:
         if isinstance(box, dict):
