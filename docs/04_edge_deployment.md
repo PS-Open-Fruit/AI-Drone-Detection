@@ -39,10 +39,37 @@ graph LR
 
 ### 1.1 CPU Performance Optimizations
 1. **Lightweight Model Tiering**:
-   - `yolo11n-obb` (Nano backbone, ~2.6M parameters) reached **97.7% mAP@50** on its 3-frame validation split (see [01](01_object_detection.md)) with a small memory and CPU footprint.
+   - The shipped detector is `yolo11n-obb` (Nano backbone, ~2.65M parameters), which keeps memory and CPU cost low. Its validation and held-out test results are in [01 §3.2](01_object_detection.md); YOLO inference takes about 21 ms per 1080p frame on the desktop CPU in §1.2.
    - Without YOLO weights, the tracker falls back to morphological candidates only, which avoids neural inference entirely. In the current code, `--fusion seg` still runs YOLO whenever weights are present; skipping it in that mode is a possible optimization.
 2. **Lightweight Coordinate Estimation**:
    - The GBDT models (`lat.bin`, `lon.bin`, `alt.bin`) are shallow tree ensembles (200 trees, depth ≤ 5, per coordinate) evaluated on CPU, so the localization stage needs no neural network. Per-target latency on the Raspberry Pi 5 has not been benchmarked.
+
+### 1.2 Measured Desktop CPU Throughput
+**Setup:** `scripts/benchmark_pipeline.py` times the unmodified tracking pipeline (`config/default.yaml`; plain YOLO11n-OBB at 640 px, no SAHI). It ran on a **desktop Intel Core i5-14500 CPU (Windows 11, no GPU)** over 1080p competition footage (`P1_VIDEO_4`/`P1_VIDEO_5`).
+- **Runs:** 24 timed runs of 600 frames, each in a fresh process, with the first 20 frames excluded as warm-up.
+- **Cross-check:** the plain `track_video.py` agrees within about 2%.
+- **This is not a Raspberry Pi 5 measurement.** On-device speed on the Pi has not been measured.
+
+**End-to-end:** ≈ 10 FPS (median 95.7 ms/frame, p95 106 ms). Run medians are 10.2 FPS (`P1_VIDEO_5`) and 10.4 FPS (`P1_VIDEO_4`).
+
+| Stage (median ms per frame) | ms | Share |
+| :--- | :---: | :---: |
+| Video decode | 3.4 | 3.6% |
+| Morphology (`ImageProcessor.process`) | 6.6 | 7.0% |
+| **Background cleaning (`clean_image`)** | **47.7** | **50.0%** |
+| YOLO11n-OBB (21.3 ms inference) | 24.5 | 26.0% |
+| Fusion + association + track management | 0.3 | 0.3% |
+| GBDT localization (~1 ms per confirmed track) | 2.1 | 2.3% |
+| HUD render | 1.5 | 1.6% |
+| Video write (mp4v, 1080p) | 8.8 | 9.2% |
+
+**Bottleneck:** the pre-YOLO `clean_image` step, not the neural network. It does full-frame float32 NumPy arithmetic on 1920×1080×3 images in a single thread. Rewriting it with uint8/OpenCV operations is the most promising speed-up, but it hasn't been implemented or measured yet.
+
+**Thread settings:** limiting torch and OpenCV to 4 threads did not change median throughput, but it increased run-to-run variance.
+
+**Caveats:**
+- The machine was not fully idle (8–20% background load), and 3 of the 24 runs were visibly disturbed; they are reported, not excluded.
+- Medians varied by about 5% between batches.
 
 ---
 

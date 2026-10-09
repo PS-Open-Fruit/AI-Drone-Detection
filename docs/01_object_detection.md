@@ -87,6 +87,23 @@ Multiple iterations were trained on GPU clusters using datasets prepared on Robo
 - **Precision of 100%**: No false positives on the validation frames.
 - **mAP@50 of 99.5%** and **mAP@50-95 of 92.5%** on the same split.
 
+### 3.2 Shipped Model and Held-Out Check
+The detector shipped in `models/yolo11n-obb.pt` is none of the runs above. It is byte-identical to `best.pt` of a separate YOLO11n-OBB run (`tesa2025_defense`, 100 epochs, 640 px) on `drone.v5i`:
+- **Dataset:** 336 images built from 96 sources (5 augmented copies per training source, with ±15° rotation and ±25% brightness). Images are resized to 460×460 with a center crop.
+- **Splits:** 60 / 21 / 15 source images (train / validation / test), with no source image shared between splits.
+- **Validation (best fitness, epoch 74):** precision 100%, recall 99.4%, mAP@50 99.5%, mAP@50-95 85.3%.
+
+Its **15-image test split was never used for training or checkpoint selection**. Re-evaluated with `scripts/eval_detection_holdout.py` (raw detector on the 460×460 test images, without the pipeline's morphological cleaning):
+
+| Metric | Result |
+| :--- | :---: |
+| Ultralytics mAP@50 / mAP@50-95 | 72.5% / 44.9% |
+| Competition F1, IoU ≥ 0.25, conf 0.25 | 0.57 (10 TP, 15 FP, 0 FN) |
+| Competition F1, IoU ≥ 0.25, conf 0.50 | 0.53 (9 TP, 15 FP, 1 FN) |
+| Competition F1, IoU ≥ 0.25, conf 0.75 | 0.48 (8 TP, 15 FP, 2 FN) |
+
+All 15 false positives are **one stationary object**: a fixture on the stadium roofline, detected at the same position in every test image with confidence ≈ 0.85. There are no other false positives, so precision is limited by this single fixed scene element rather than by scattered errors. Suppressing static detections (e.g. a zero-motion filter or a fixed exclusion mask) is the obvious next fix. With only 15 images and 10 drones, these figures have wide uncertainty.
+
 ---
 
 ## 4. Slicing Aided Hyper Inference (SAHI)

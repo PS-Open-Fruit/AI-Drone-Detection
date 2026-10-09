@@ -131,7 +131,7 @@ Detections scoring above `soft_thres = 0.25` are ranked, and the top candidates 
 
 The system was evaluated with the project's `evaluate_predictions.py`, which implements the competition's scoring formula, over **459 detections on 413 labeled training images** (`P2_DATA_TRAIN`).
 
-> **Training-set score, not a held-out test.** The GBDT regressors were trained on this same labeled set (the training script holds out only a random 20% of samples), and the evaluator itself labels its output "Competition Criteria, Train Set". The competition's real test set had no public ground truth, so no true test score exists in the archive. See Section 5.3 for the one held-out measurement that was recorded.
+> **Training-set score, not a held-out test.** The GBDT regressors were trained on this same labeled set (the training script holds out only a random 20% of samples), and the evaluator itself labels its output "Competition Criteria, Train Set". The competition's real test set had no public ground truth, so no true test score exists in the archive. Section 5.3 covers the one held-out measurement that was recorded; Section 5.5 gives a cross-validated re-run with this repository.
 
 ### 5.1 Comprehensive Performance Metrics
 
@@ -160,9 +160,40 @@ The training script holds out a random 20% of samples (`train_test_split(test_si
 | Longitude | $4.30 \times 10^{-5}$° (≈ 4.6 m) |
 | Altitude | 2.93 m |
 
-These are the only held-out localization numbers in the archive; the competition-formula score on held-out data was never computed.
+These are the only held-out localization numbers in the archive; the competition-formula score on held-out data was never computed. Because the split was random over sequential frames, they are optimistic. Section 5.5 shows that the same kind of split reproduces these MAEs, while holding out contiguous frame ranges roughly triples them.
 
-### 5.4 Final Submission Files
+### 5.5 Cross-Validated Re-Run (This Repository)
+`scripts/cv_localization.py` re-measures localization with this repository's code and shipped detector:
+- **Box extraction:** the shipped inference path from `localize_drones.py` (morphology → `clean_image` → YOLO → OSD/foliage filter → adaptive `FusionEngine`), applied identically to training and test images.
+- **Box selection:** one box per image, the highest fused score (no ground truth used).
+- **Models:** scaler and GBDTs refit on the training folds only, with the config hyperparameters.
+- **Scoring:** every score is cross-checked against `evaluation.py`.
+
+**Coverage:** 416 of 438 labeled images have a detection. The 22 misses are clustered in image ranges 251–262, 370–377, 392–394 and 437–438.
+
+| Protocol | Weighted score (pooled) | Score across folds | Angle mean / median | Height mean / median | Range mean / median | Lat / lon / alt MAE |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Blocked 5-fold** (contiguous image ranges) | **7.84** | 7.80 ± 2.69 | 5.33° / 4.00° | 8.64 m / 6.46 m | 18.75 m / 6.87 m | 11.2 / 16.0 / 8.6 m |
+| Random 5-fold (seed 42) | 3.58 | 3.58 ± 0.35 | 3.53° / 2.30° | 2.63 m / 1.50 m | 4.75 m / 2.64 m | 3.9 / 4.3 / 2.6 m |
+| In-sample (train = test) | 0.21 | — | 0.22° / 0.15° | 0.13 m / 0.10 m | 0.23 m / 0.17 m | 0.2 / 0.2 / 0.1 m |
+
+**What the rows mean:**
+- If the 22 missed images are scored with the training-fold mean position as a fallback, the pooled scores become 8.84 (blocked) and 4.79 (random).
+- Random-split seeds 0–9 give 3.34–3.48.
+- One blocked fold, images 89–176, scores 12.5: it covers ranges and altitudes (up to about 170 m range, 97 m altitude) that the other folds barely reach. Without it, the blocked folds average 6.6.
+
+**Why blocked CV is the headline.** The 438 images are consecutive frames of 4–5 continuous flights:
+- Adjacent frames are a median 2.45 m apart in 3D, against 39.6 m for random pairs.
+- For 74% of images, the closest ground-truth position is the adjacent frame.
+
+Under random folds, a test image's nearest training position is a median 1.7 m away; under blocked folds it is 6.3 m. Holding out contiguous chunks of 5, 10, 20 and 44 frames gives pooled scores of 4.93, 5.22, 7.32 and 6.45. The score climbs as soon as neighbouring frames leave the training set.
+
+**Pipeline observations from this run:**
+- YOLO (on the cleaned image) supplies the chosen box in only 60 of 416 images. The other 356 boxes come from the morphology branch, inflated by the 50×50 dilation (median 63×53 px, against 53×31 px for YOLO boxes).
+- Under random CV, YOLO-box samples score worse (5.17) than morphology-box samples (3.31).
+- The 12 images with two candidate boxes score 8.09, against 3.44 for single-box images.
+
+### 5.6 Final Submission Files
 - Generated files: `submission_improved.csv` and `submission2.csv`.
 - Columns formatted to specifications:
   ```csv
