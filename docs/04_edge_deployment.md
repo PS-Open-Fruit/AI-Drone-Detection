@@ -16,9 +16,9 @@ graph LR
         CamCapture["Camera Capture Stream\n(30 FPS, OpenCV VideoCapture)"]
         YoloNano["Lightweight Inference\n(YOLO11n-OBB CPU / NCNN)"]
         MorphSeg["SIMD-Accelerated Morphology\n(OpenCV NEON Intrinsics)"]
-        GBDT_Inference["GBDT Multi-Coordinate Regression\n(< 1 ms Latency)"]
+        GBDT_Inference["GBDT Multi-Coordinate Regression\n(CPU)"]
         HUD_Engine["HUD Renderer & Video Encoder"]
-        Dispatcher["Telemetry Dispatcher\n(REST / WebSocket API)"]
+        Dispatcher["Telemetry Dispatcher\n(HTTP POST)"]
         
         CamCapture --> YoloNano
         CamCapture --> MorphSeg
@@ -39,10 +39,10 @@ graph LR
 
 ### 1.1 CPU Performance Optimizations
 1. **Lightweight Model Tiering**:
-   - `yolo11n-obb` (Nano backbone, ~2.6M parameters) achieves **97.7% mAP@50** while maintaining low memory and CPU footprint.
-   - For ultra-low-power standby mode, the system can fallback to `fusion_mode = "seg"` (pure morphological contour detection) which uses near-zero CPU, activating neural inference only upon candidate detection.
-2. **Sub-Millisecond Coordinate Estimation**:
-   - The GBDT models (`lat.bin`, `lon.bin`, `alt.bin`) evaluate in **under $0.8\text{ ms}$ per target** on ARM CPU, completely eliminating neural network overhead during the localization stage.
+   - `yolo11n-obb` (Nano backbone, ~2.6M parameters) reached **97.7% mAP@50** on its 3-frame validation split (see [01](01_object_detection.md)) with a small memory and CPU footprint.
+   - Without YOLO weights, the tracker falls back to morphological candidates only, which avoids neural inference entirely. In the current code, `--fusion seg` still runs YOLO whenever weights are present; skipping it in that mode is a possible optimization.
+2. **Lightweight Coordinate Estimation**:
+   - The GBDT models (`lat.bin`, `lon.bin`, `alt.bin`) are shallow tree ensembles (200 trees, depth ≤ 5, per coordinate) evaluated on CPU, so the localization stage needs no neural network. Per-target latency on the Raspberry Pi 5 has not been benchmarked.
 
 ---
 
@@ -106,6 +106,8 @@ Per contest guidelines (`TESA 2025 2a58d292ccc28118a299d224b20ea387.md`), edge n
 }
 ```
 
+> **Note:** This is an illustrative payload expanded from the contest's First Alert format (time; per-object frame, id, type, lat, lon, velocity, direction; `image_base64`), not output captured from this system. This repo's `TelemetryDispatcher` currently sets `classification` to `"Drone"`, sends `velocity_mps` and `direction_deg` as `null`, does not emit `distance_m` or `theta_deg`, and only POSTs when `telemetry.enabled` is set with an endpoint (off by default).
+
 ---
 
 ## 3. Project Archive Inventory
@@ -137,8 +139,8 @@ c:\Users\Atomic\Downloads\TESA 2025 Reorganize\Archived Project\
 ├── tesa_day2_localization.zip (628 MB)
 │   ├── ai-collab/tesa_day2_localization/
 │   │   ├── train_model.py                         # Deep Learning CNN localization (EfficientNet-B0)
-│   │   ├── evaluate_predictions.py                # Official scoring evaluator (Angle/Height/Range)
-│   │   ├── evaluation_results.csv                 # Detailed 459-image evaluation logs (Total Error = 3.33)
+│   │   ├── evaluate_predictions.py                # Scoring script implementing the competition formula
+│   │   ├── evaluation_results.csv                 # 459 detections on training images (Total Error = 3.33)
 │   │   └── P2_DATA_TRAIN/                         # Paired .jpg and .csv ground truth
 │   └── ai-collab/tesa_day2_localization/tesa_kiss_with_yolo/
 │       ├── aerial_ml_tracker_yolo_softfusion.py   # Soft-Fusion GBDT regression engine
@@ -195,7 +197,7 @@ python aerial_ml_tracker_yolo_softfusion.py \
   --fusion soft \
   --device 0
 
-# 2. Run official scoring evaluation
+# 2. Score predictions with the competition formula (training-set evaluation)
 python evaluate_predictions.py \
   --predictions drone_predictions.csv \
   --ground-truth P2_DATA_TRAIN/ \

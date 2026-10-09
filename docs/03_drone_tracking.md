@@ -1,4 +1,4 @@
-# Problem 3: Drone Tracking — Video Multi-Object Tracking & Real-Time Telemetry HUD
+# Problem 3: Drone Tracking — Video Multi-Object Tracking & Telemetry HUD
 ## Technical Report & System Architecture
 
 ---

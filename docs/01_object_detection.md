@@ -81,10 +81,11 @@ Multiple iterations were trained on GPU clusters using datasets prepared on Robo
 | **Train 12** | `yolo11s-obb` | `drone.v4` | 100 | 640 | — | — | — | — | Small model testing on synthetic boxes |
 | **Train 13** | `yolo11s-obb` | `drone.v4` | 100 | 640 | — | — | — | — | Small model convergence study |
 
-#### Key Highlights of Champion Model (Train 10):
-- **Precision of 100%**: Virtually zero false alarms on clean validation sets.
-- **mAP@50 of 99.5%**: Outstanding localization across aerial orientations.
-- **mAP@50-95 of 92.5%**: High IoU accuracy across strict bounding box overlap thresholds.
+> **How much to read into these numbers.** Values are final-epoch metrics on each run's own validation split. `drone.v1` has only 14 images (10 train / 3 validation / 1 test). Its validation frames (`frame_0004`, `frame_0012`, `frame_0026`; 84 labeled drones in total) are interleaved with the training frames of the same sequence, so the Train 6–10 scores are sanity checks, not estimates of performance on unseen footage. `drone.v3`/`drone.v4` are larger (200 / 40 / 16 images).
+
+#### Train 10 Highlights (3-frame `drone.v1` validation split):
+- **Precision of 100%**: No false positives on the validation frames.
+- **mAP@50 of 99.5%** and **mAP@50-95 of 92.5%** on the same split.
 
 ---
 
@@ -119,11 +120,13 @@ To overcome this degradation, the system deployed SAHI:
 
 ## 5. Automated Confidence Threshold Optimization
 
-Rather than arbitrarily selecting an inference confidence threshold, `auto_tune_confidence.py` conducted an automated parameter sweep against known ground truth (`drone.csv`).
+Rather than arbitrarily selecting an inference confidence threshold, `auto_tune_confidence.py` conducted an automated parameter sweep against known ground truth (`drone.csv`, per-image drone counts for 96 sample images), using SAHI with 640 px slices.
+
+> **Caveat:** The threshold was chosen on these same 96 images, the checkpoint used (`model.pt`) is not recorded, and 19 of the 96 images also appear in the `drone.v3`/`drone.v4` training split. Treat 77.08% as an optimistic, in-sample figure, not a test-set accuracy.
 
 ### 5.1 Optimization Sweep Results
 
-| Confidence Threshold | Exact Image Accuracy (%) | Correct Predictions | RMSE | Over-Predictions (FP) | Under-Predictions (FN) |
+| Confidence Threshold | Exact Image Accuracy (%) | Correct Predictions | Count RMSE | Over-Counted Images | Under-Counted Images |
 | :---: | :---: | :---: | :---: | :---: | :---: |
 | 0.10 | 42.71% | 41 / 96 | 2.572 | 53 | 2 |
 | 0.25 | 58.33% | 56 / 96 | 1.531 | 37 | 3 |
@@ -138,7 +141,7 @@ Rather than arbitrarily selecting an inference confidence threshold, `auto_tune_
 ### 5.2 Key Insights
 - Low thresholds ($\le 0.30$) yielded excessive False Positives due to cloud edges and ground contrast.
 - High thresholds ($\ge 0.85$) suffered from False Negatives on heavily shadowed drones.
-- **The optimal operating point was identified at $\text{conf} \in [0.70, 0.75]$**, which drastically suppressed False Positives (over-predictions dropped from 53 down to 7) while maintaining high Recall and minimum RMSE ($0.568$).
+- **The best operating point on this set was $\text{conf} = 0.75$**: over-counted images dropped from 53 (at 0.10) to 7, while under-counted images rose from 2 to 15, giving the lowest count RMSE ($0.568$).
 
 ---
 

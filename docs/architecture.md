@@ -11,7 +11,7 @@ flowchart TD
     A["Raw Video Frame / Image Stream"] --> B["ImageProcessor\n(Morphological Preprocessing)"]
     A --> C["YoloDetector / SahiDetector\n(YOLO11-OBB Inference)"]
     
-    B -->|"Segmentation Candidates"| D["FusionEngine\n(Multi-Modal Consensus)"]
+    B -->|"Segmentation Candidates"| D["FusionEngine\n(Multi-Cue Consensus)"]
     C -->|"YOLO Detections"| D
     
     D -->|"Fused Detections"| E["VideoTracker\n(Greedy Centroid Association)"]
@@ -107,17 +107,17 @@ graph TD
 - **`ImageProcessor`**: Classical morphological pipeline. Converts frames to grayscale, binarizes (inverting pixel intensities), dilates with a rectangular kernel ($50 \times 50$) to bridge airframe and propeller fragments, applies morphological closing ($5 \times 5$), filters contours by area, and suppresses background clutter.
 - **`YoloDetector`**: Wraps YOLO11-OBB (Oriented Bounding Boxes) and standard bounding box inference. Retains rotated bounding polygon coordinates for close-proximity separation of multi-drone swarms.
 - **`SahiDetector`**: Slicing Aided Hyper Inference. Slices full-resolution image inputs (e.g. 4K/1080p) into $640 \times 640$ overlapping tiles (25% overlap) and merges candidates with NMS to preserve small, distant targets.
-- **`confidence_tuner`**: Automated parameter sweep utility to compute precision, recall, RMSE, and exact count match accuracy across detection thresholds.
+- **`confidence_tuner`**: Automated parameter sweep utility that computes exact per-image count accuracy, count RMSE, and total over-/under-counted drones across detection thresholds.
 
 ### 2. Localization Layer (`defense/localization/`)
 - **`feature_encoder`**: Transforms 2D bounding boxes into a standardized 20-dimensional spatial feature vector capturing optical coordinates, normalized image ratios, radial distance, polar angle, quadrant indices, 4-corner distances, polynomial terms ($nx^2, ny^2, nx \cdot ny$), and trigonometric projections ($\sin\theta, \cos\theta$).
 - **`GBDTRegressor`**: Three independent Gradient Boosting Regressors for latitude, longitude, and altitude above sea level, fitted with standard scaling.
-- **`FusionEngine`**: Integrates deep learning and segmentation candidates using multi-modal scoring (IoU, physical shape plausibility, and motion continuity) across 6 operational modes (`adaptive`, `filter`, `soft`, `hard`, `yolo`, `seg`).
+- **`FusionEngine`**: Integrates deep learning and segmentation candidates using multi-cue scoring (IoU, physical shape plausibility, and motion continuity) across 6 operational modes (`adaptive`, `filter`, `soft`, `hard`, `yolo`, `seg`).
 - **`evaluation`**: Calculates geodesic Haversine distance errors, azimuth bearing discrepancies, and altitude deviations weighted by competition metric:
   $$\text{Score} = 0.70 \cdot \overline{\Delta\theta} + 0.15 \cdot \overline{\Delta h} + 0.15 \cdot \overline{\Delta r}$$
 
 ### 3. Tracking Layer (`defense/tracking/`)
-- **`DroneTrack`**: Stateful tracker encapsulating track ID, 10-color cyclical palette, bounding box history, confidence, 3D coordinates, consecutive confirmation counter (default 3 frames), and lost frame memory (default 30 frames).
+- **`DroneTrack`**: Stateful tracker encapsulating track ID, 10-color cyclical palette, bounding box history, confidence, 3D coordinates, confirmation counter (confirmed after 3 matched frames by default), and lost frame memory (default 30 frames).
 - **`VideoTracker`**: Greedy nearest-centroid association with Euclidean distance gating. Manages track creation, confirmation, updates, lost state, and pruning.
-- **`HUDRenderer`**: Renders real-time visual telemetry overlay with global status bar, bounding boxes, centroid dots, auto-positioning telemetry cards (ID, confidence, lat, lon, alt), and track badges.
-- **`TelemetryDispatcher`**: Builds standardized JSON alert payloads containing timestamp, station coordinates, detected objects, and Base64-encoded frame images for immediate C2 dispatch upon first confirmed detection.
+- **`HUDRenderer`**: Renders the per-frame visual telemetry overlay with global status bar, bounding boxes, centroid dots, auto-positioning telemetry cards (ID, confidence, lat, lon, alt), and track badges.
+- **`TelemetryDispatcher`**: Builds standardized JSON alert payloads containing timestamp, station coordinates, detected objects, and a Base64-encoded frame image. The alert is sent once, on the first confirmed detection, only when an API endpoint is configured (disabled by default).
