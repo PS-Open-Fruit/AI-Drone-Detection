@@ -22,9 +22,9 @@ class YoloDetector:
         self.confidence = float(confidence)
         self.device = device
 
-    def detect(self, image: np.ndarray) -> list[dict]:
+    def detect(self, image: np.ndarray, imgsz: int = None) -> list[dict]:
         """
-        Run inference on a single image (BGR numpy array).
+        Run inference on a single image (BGR numpy array). `imgsz` overrides the model's input size.
         Returns list of detections:
             {
                 "center_x": int,
@@ -36,7 +36,8 @@ class YoloDetector:
             }
         """
         # Note: do NOT pass verbose=False to keep progress visible
-        results = self.model.predict(image, conf=self.confidence, device=self.device)
+        kwargs = {"imgsz": int(imgsz)} if imgsz else {}
+        results = self.model.predict(image, conf=self.confidence, device=self.device, **kwargs)
         detections = []
 
         if not results:

@@ -36,7 +36,7 @@ class SahiDetector:
         log("SAHI", f"Initialized: model={model_path}, slice={slice_size}x{slice_size}, "
                      f"overlap={overlap_ratio}, nms={nms_threshold}")
 
-    def detect(self, image_input) -> list[dict]:
+    def detect(self, image_input, imgsz: int = None) -> list[dict]:
         """
         Run SAHI sliced prediction on an image path (str) or numpy array.
         Returns list of detections matching YoloDetector.detect() format.

@@ -37,16 +37,17 @@ class ImageProcessor:
         self.foliage_y_ratio = float(cfg.get("foliage_y_ratio", 0.88))
         self.roi_padding = int(cfg.get("roi_padding", 25))
 
-    def process(self, image: np.ndarray) -> tuple[np.ndarray, list[tuple]]:
+    def process(self, image: np.ndarray, binary: np.ndarray = None) -> tuple[np.ndarray, list[tuple]]:
         """
         Execute full preprocessing pipeline.
+        `binary` may be passed if the caller already binarized the frame (dark pixels = 255).
         Returns:
             (binary_mask, candidate_boxes) where:
                 binary_mask: uint8 image (255 background, 0 target object)
                 candidate_boxes: list of (x, y, w, h) bounding boxes
         """
-        gray = self._to_grayscale(image)
-        binary = self._binarize(gray)
+        if binary is None:
+            binary = self._binarize(self._to_grayscale(image))
         dilated, eroded, closed = self._morphological_filter(binary)
 
         h, w = image.shape[:2]
@@ -66,6 +67,15 @@ class ImageProcessor:
 
         log("ImageProc", f"  Morphological filter: {len(candidates)} candidates after area gating")
         return binary_mask, candidates
+
+    def in_exclusion_zone(self, cx: float, cy: float, image_shape: tuple) -> bool:
+        """True if a detection centre lies in the OSD timestamp banner or the lower foliage band."""
+        ih, iw = image_shape[:2]
+        if self.suppress_timestamp and cy < self.timestamp_y_max and cx > self.timestamp_x_ratio * iw:
+            return True
+        if self.suppress_foliage and cy > self.foliage_y_ratio * ih:
+            return True
+        return False
 
     def clean_image(self, image: np.ndarray, candidates: list[tuple] = None, padding: int = None) -> np.ndarray:
         """
@@ -99,10 +109,10 @@ class ImageProcessor:
         if self.suppress_foliage:
             roi_mask[int(h * self.foliage_y_ratio):h, :] = 0
 
-        bg_mask = cv2.bitwise_not(roi_mask)
-        bg_mask_3ch = cv2.cvtColor(bg_mask, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
-        cleaned = image.astype(np.float32) * (1.0 - bg_mask_3ch * (1.0 - self.dim_factor))
-        return np.clip(cleaned, 0, 255).astype(np.uint8)
+        # uint8 path: dim the whole frame, then restore ROI pixels (float32 math here cost ~48 ms/1080p frame)
+        cleaned = cv2.convertScaleAbs(image, alpha=self.dim_factor)
+        cv2.copyTo(image, roi_mask, cleaned)
+        return cleaned
 
     def _to_grayscale(self, image: np.ndarray) -> np.ndarray:
         return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -166,9 +176,9 @@ class ImageProcessor:
         Dim background while keeping detected candidate regions at full intensity.
         binary_mask: 255 for background, 0 for target objects.
         """
-        bg_mask_3ch = cv2.cvtColor(binary_mask, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
-        dimmed = image.astype(np.float32) * (1.0 - bg_mask_3ch * (1.0 - self.dim_factor))
-        return np.clip(dimmed, 0, 255).astype(np.uint8)
+        dimmed = cv2.convertScaleAbs(image, alpha=self.dim_factor)
+        cv2.copyTo(image, cv2.bitwise_not(binary_mask), dimmed)
+        return dimmed
 
     def _dim_background(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         return self.dim_background(image, mask)
