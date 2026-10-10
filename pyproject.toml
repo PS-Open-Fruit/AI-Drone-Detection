@@ -16,6 +16,9 @@ dependencies = [
     "requests>=2.31.0",
     "Pillow>=10.0.0",
     "pandas>=2.3.3",
+    # Already required by ultralytics; listed so [tool.uv.sources] can pick the CPU build on ARM
+    "torch>=1.8.0",
+    "torchvision>=0.9.0",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +29,16 @@ dev = [
 edge = [
     "ncnn>=1.0.20260526",
 ]
+
+[tool.uv.sources]
+# On ARM boards (Raspberry Pi) the default PyPI torch is the CUDA build (~2.5 GB of unusable NVIDIA libraries).
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [project.scripts]
 defense-detect = "scripts.detect_images:main"
