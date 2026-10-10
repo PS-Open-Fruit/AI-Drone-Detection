@@ -45,8 +45,8 @@ from defense.config import (
     get_tracking_config,
     get_camera_config,
 )
-from defense.detection import YoloDetector, ImageProcessor
-from defense.localization import GBDTRegressor, FusionEngine
+from defense.detection import build_drone_detector
+from defense.localization import GeoLocalizer, FusionEngine
 from defense.tracking import VideoTracker, HUDRenderer, TelemetryDispatcher
 from defense.utils.video_io import open_video, get_video_info, create_video_writer
 from defense.utils.logger import log
@@ -63,8 +63,10 @@ DISCLAIMER = (
 # Directly timed stages. Their per-frame sum plus the two residuals equals the end-to-end frame time.
 TOP_STAGES = [
     ("decode", "Video decode (cap.read)"),
+    ("binarize", "Grayscale + threshold (DroneDetector)"),
     ("morphology", "Morphology (ImageProcessor.process)"),
-    ("clean_image", "clean_image (dim + OSD/foliage mask)"),
+    ("tight_boxes", "Tight candidate boxes (DroneDetector)"),
+    ("clean_image", "clean_image (legacy path; unused by DroneDetector)"),
     ("yolo", "YOLO detect (YoloDetector.detect)"),
     ("fusion", "Fusion (FusionEngine.fuse)"),
     ("tracking", "Association + track management"),
@@ -88,7 +90,7 @@ SUB_STAGES = {
     ],
     "localization": [
         ("gbdt_features", "encode_features"),
-        ("gbdt_predict", "GBDTRegressor.predict"),
+        ("gbdt_predict", "GeoLocalizer.predict"),
     ],
 }
 # Residuals that are not directly timed (used for the reconciliation check).
@@ -126,8 +128,12 @@ class StageTimer:
         return out
 
 
-def instrument(timer: StageTimer, tracker, image_processor, detector, fusion_engine, localizer):
+def instrument(timer: StageTimer, tracker, image_processor, detector, fusion_engine, localizer, drone_detector=None):
     """Wrap component methods with timers. Arguments and call order are passed through unchanged."""
+    image_processor._to_grayscale = timer.wrap("binarize", image_processor._to_grayscale)
+    image_processor._binarize = timer.wrap("binarize", image_processor._binarize)
+    if drone_detector is not None:
+        drone_detector._tight_box = timer.wrap("tight_boxes", drone_detector._tight_box)
     image_processor.process = timer.wrap("morphology", image_processor.process)
     image_processor.clean_image = timer.wrap("clean_image", image_processor.clean_image)
     fusion_engine.fuse = timer.wrap("fusion", fusion_engine.fuse)
@@ -205,7 +211,7 @@ def derive_columns(cols: dict) -> dict:
     get = lambda k: g.get(k, z)
     g["yolo_overhead"] = get("yolo") - get("yolo_preprocess") - get("yolo_inference") - get("yolo_postprocess")
     g["localization"] = get("gbdt_features") + get("gbdt_predict")
-    timed_inside = (get("morphology") + get("clean_image") + get("yolo") + get("fusion")
+    timed_inside = (get("binarize") + get("morphology") + get("tight_boxes") + get("clean_image") + get("yolo") + get("fusion")
                     + get("association") + get("merge") + g["localization"])
     g["tracker_other"] = get("process_frame") - timed_inside
     g["tracking"] = get("association") + get("merge") + g["tracker_other"]
@@ -253,6 +259,31 @@ def _cpu_name() -> str:
             if line.lower().startswith(("model name", "hardware")):
                 return line.split(":", 1)[1].strip()
     return platform.processor() or "unknown"
+
+
+def _device_model() -> str:
+    """Board name on single-board computers (e.g. "Raspberry Pi 5 Model B Rev 1.0"); empty elsewhere."""
+    for path in ("/proc/device-tree/model", "/sys/firmware/devicetree/base/model"):
+        try:
+            return Path(path).read_text(errors="ignore").strip("\x00").strip()
+        except OSError:
+            continue
+    return ""
+
+
+def thermal_snapshot() -> dict:
+    """SoC temperature and (on Raspberry Pi) firmware throttling flags. Empty fields where unavailable."""
+    snap = {"cpu_temp_c": None, "throttled": None}
+    try:
+        snap["cpu_temp_c"] = round(int(Path("/sys/class/thermal/thermal_zone0/temp").read_text()) / 1000.0, 1)
+    except (OSError, ValueError):
+        pass
+    try:
+        out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=5)
+        snap["throttled"] = out.stdout.strip() or None  # "throttled=0x0" means no throttling ever occurred
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return snap
 
 
 def _power_plan() -> str:
@@ -304,6 +335,8 @@ def collect_system_info() -> dict:
     return {
         "hardware": {
             "cpu_name": _cpu_name(),
+            "device_model": _device_model(),
+            "thermal_at_start": thermal_snapshot(),
             "cpu_physical_cores": psutil.cpu_count(logical=False),
             "cpu_logical_cores": psutil.cpu_count(logical=True),
             "ram_total_gb": round(vm.total / 1024 ** 3, 1),
@@ -388,9 +421,11 @@ def benchmark_once(args) -> dict:
     tel_cfg = cfg.get("telemetry", {})
 
     yolo_path = args.yolo_model or det_cfg.get("yolo_model_path", "models/yolo11n-obb.pt")
-    gbdt_dir = args.gbdt_models or loc_cfg.get("gbdt_models_dir", "models/")
+    gbdt_dir = args.gbdt_models or loc_cfg.get("models_dir", "models/")
     fusion_mode = args.fusion or loc_cfg.get("fusion_mode", "adaptive")
-    confidence = args.conf if args.conf is not None else float(det_cfg.get("confidence", 0.75))
+    if args.conf is not None:
+        det_cfg["confidence"] = args.conf
+    confidence = float(det_cfg.get("confidence", 0.40))
 
     video_path = args.videos[0]
     cap = open_video(video_path)
@@ -401,11 +436,8 @@ def benchmark_once(args) -> dict:
     frame_count = info["frame_count"]
 
     t0 = time.perf_counter()
-    detector = None
-    if Path(yolo_path).exists():
-        detector = YoloDetector(model_path=yolo_path, confidence=confidence, device=det_cfg.get("device", "cpu"))
-    else:
-        log("Defense", f"⚠️ YOLO weights not found at {yolo_path}. Proceeding with morphological segmentation only.")
+    drone_detector = build_drone_detector(det_cfg, yolo_path=yolo_path)
+    detector = drone_detector.yolo
     yolo_load_ms = (time.perf_counter() - t0) * 1e3
     # Count parameters before the first predict fuses Conv+BN in place.
     yolo_params = int(sum(p.numel() for p in detector.model.model.parameters())) if detector else 0
@@ -413,31 +445,20 @@ def benchmark_once(args) -> dict:
     t0 = time.perf_counter()
     localizer = None
     try:
-        localizer = GBDTRegressor(models_dir=gbdt_dir)
+        localizer = GeoLocalizer(cam_cfg, models_dir=gbdt_dir)
         localizer.load()
     except Exception as e:
-        log("Defense", f"⚠️ GBDT models not loaded: {e}. Localization disabled on HUD.")
+        log("Defense", f"⚠️ Localizer not loaded: {e}. Localization disabled on HUD.")
         localizer = None
     gbdt_load_ms = (time.perf_counter() - t0) * 1e3
 
-    image_processor = ImageProcessor(det_cfg)
-    fusion_engine = FusionEngine(
-        mode=fusion_mode,
-        iou_weight=loc_cfg.get("iou_weight", 0.60),
-        shape_weight=loc_cfg.get("shape_weight", 0.30),
-        motion_weight=loc_cfg.get("motion_weight", 0.10),
-        soft_threshold=loc_cfg.get("soft_threshold", 0.25),
-        area_ratio_min=loc_cfg.get("area_ratio_min", 0.00005),
-        area_ratio_max=loc_cfg.get("area_ratio_max", 0.003),
-        aspect_ratio_min=loc_cfg.get("aspect_ratio_min", 0.4),
-        aspect_ratio_max=loc_cfg.get("aspect_ratio_max", 3.0),
-    )
+    image_processor = drone_detector.image_processor
+    fusion_engine = FusionEngine.from_config(loc_cfg, mode=fusion_mode)
     tracker = VideoTracker(
-        detector=detector,
+        detector=drone_detector,
         localizer=localizer,
         fusion_engine=fusion_engine,
         config=trk_cfg,
-        image_processor=image_processor
     )
     hud = HUDRenderer()
     telemetry = TelemetryDispatcher(
@@ -449,7 +470,7 @@ def benchmark_once(args) -> dict:
     writer = create_video_writer(str(out_video), fps, width, height, codec=codec)
 
     timer = StageTimer()
-    instrument(timer, tracker, image_processor, detector, fusion_engine, localizer)
+    instrument(timer, tracker, image_processor, detector, fusion_engine, localizer, drone_detector)
     if threads != "default":
         apply_threads(int(threads))
     threads_before = observed_threads()
@@ -785,6 +806,7 @@ def orchestrate(args):
         "output_video": "Annotated video written as in track_video.py, then deleted unless --keep-videos.",
     }
     batches = [{"batch": 1, "created": created, "command": command, "idle_check": idle}]
+    system["hardware"]["thermal_at_end"] = thermal_snapshot()
     write_results(out_path, system, protocol, batches, runs, command)
     log("Bench", f"   Worker logs: {work_dir}")
 

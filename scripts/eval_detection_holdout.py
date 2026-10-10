@@ -2,11 +2,14 @@ import argparse
 import glob
 import json
 import os
+import re
 from pathlib import Path
 
 import numpy as np
 from ultralytics import YOLO
 
+from defense.config import load_config, get_detection_config
+from defense.detection import build_drone_detector
 from defense.utils.logger import log
 
 
@@ -71,6 +74,82 @@ def competition_f1(preds: dict, label_dir: str, conf: float, iou_thr: float) -> 
             "false_positives": false_positives}
 
 
+def _source_name(path: str) -> str:
+    return re.sub(r"_(jpg|png|jpeg)\.rf\..*", "", os.path.basename(path))
+
+
+def evaluate_full_pipeline(args) -> dict:
+    """Score the shipped DroneDetector on the ORIGINAL full-resolution frames.
+
+    The dataset's split images are unscaled crops of those frames at a fixed window (verified by template
+    matching), so labels map back with a pure offset; only detections inside the window are scored.
+    Also reports exact per-image count accuracy on images that appear in no train/valid split.
+    """
+    import cv2
+    import pandas as pd
+
+    wx, wy, ws = (int(v) for v in args.window.split(","))
+    det_cfg = get_detection_config(load_config(args.config))
+    det_cfg["confidence"] = min(args.confs)
+    detector = build_drone_detector(det_cfg, yolo_path=args.model)
+
+    labels = {}
+    for lf in glob.glob(os.path.join(args.dataset, args.split, "labels", "*.txt")):
+        boxes = []
+        for line in open(lf).read().splitlines():
+            v = line.split()
+            if len(v) == 9:
+                pts = np.array(v[1:], dtype=float).reshape(4, 2) * ws + [wx, wy]
+                boxes.append(_aabb(pts))
+        labels[_source_name(lf)] = boxes
+
+    used_sources = set()
+    for sp in ("train", "valid"):
+        used_sources |= {_source_name(f) for f in glob.glob(os.path.join(args.dataset, sp, "images", "*"))}
+    counts = pd.read_csv(args.counts).set_index("file_name")["num_of_drone"].to_dict() if args.counts else {}
+    untouched = sorted(n for n in counts if n not in used_sources)
+
+    dets = {}
+    for name in sorted(set(labels) | set(untouched)):
+        img = cv2.imread(os.path.join(args.full_frames, name + ".jpg"))
+        if img is None:
+            raise FileNotFoundError(f"Missing full-resolution frame for {name} in {args.full_frames}")
+        dets[name] = detector.detect(img)["yolo"]
+
+    out = {"mode": "full_pipeline", "window_xyw": [wx, wy, ws], "n_labelled_images": len(labels),
+           "n_labelled_drones": sum(len(b) for b in labels.values()), "n_untouched_count_images": len(untouched),
+           "detector": {k: det_cfg.get(k) for k in ("yolo_mode", "crop_size", "yolo_imgsz", "standalone_conf")},
+           "by_conf": {}}
+    for conf in args.confs:
+        tp = fp = fn = 0
+        for name, gts in labels.items():
+            ds = sorted((d for d in dets[name] if d["confidence"] >= conf
+                         and wx <= d["center_x"] <= wx + ws and wy <= d["center_y"] <= wy + ws),
+                        key=lambda d: -d["confidence"])
+            used = set()
+            for d in ds:
+                box = np.array([d["center_x"] - d["width"] / 2, d["center_y"] - d["height"] / 2,
+                                d["center_x"] + d["width"] / 2, d["center_y"] + d["height"] / 2])
+                ious = [(_iou(box, g), i) for i, g in enumerate(gts) if i not in used]
+                best = max(ious, default=(0.0, -1))
+                if best[0] >= args.iou:
+                    tp += 1
+                    used.add(best[1])
+                else:
+                    fp += 1
+            fn += len(gts) - len(used)
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        correct = sum(1 for n in untouched if sum(1 for d in dets[n] if d["confidence"] >= conf) == counts[n])
+        out["by_conf"][str(conf)] = {"tp": tp, "fp": fp, "fn": fn, "precision": precision, "recall": recall,
+                                     "f1": f1, "count_accuracy": correct / len(untouched) if untouched else None,
+                                     "count_correct": correct}
+        log("HoldoutEval", f"conf {conf}: F1 {f1:.3f} (TP {tp}, FP {fp}, FN {fn}) | count accuracy "
+                           f"{correct}/{len(untouched)} untouched images")
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate a YOLO-OBB detector on a held-out YOLO-format split")
     parser.add_argument("--model", type=str, default="models/yolo11n-obb.pt", help="Path to YOLO model (.pt)")
@@ -80,7 +159,22 @@ def main():
     parser.add_argument("--iou", type=float, default=0.25, help="IoU threshold for the competition F1")
     parser.add_argument("--device", type=str, default="cpu", help="Device (cpu, cuda, etc.)")
     parser.add_argument("--output", type=str, default="data/detection_holdout_results.json", help="Results JSON path")
+    parser.add_argument("--full-frames", type=str, default=None,
+                        help="Evaluate the full shipped pipeline on these original full-resolution frames instead")
+    parser.add_argument("--window", type=str, default="730,310,460",
+                        help="x,y,size of the crop window the split images were cut from (full-frames mode)")
+    parser.add_argument("--counts", type=str, default=None,
+                        help="CSV (file_name,num_of_drone) for count accuracy on images in no train/valid split")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config (full-frames mode)")
     args = parser.parse_args()
+
+    if args.full_frames:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        results = evaluate_full_pipeline(args)
+        out_path.write_text(json.dumps(results, indent=2))
+        log("HoldoutEval", f"✅ Results saved to {out_path}")
+        return
 
     model = YOLO(args.model)
     out_path = Path(args.output)

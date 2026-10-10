@@ -1,14 +1,15 @@
 """Held-out (cross-validated) localization score for the Problem 2 geo-regression pipeline.
 
 Protocol (see --help for knobs):
-  1. Box extraction = the shipped inference path of scripts/localize_drones.py:
-     ImageProcessor.process -> clean_image -> YoloDetector.detect(clean) -> OSD/foliage
-     filter -> FusionEngine.fuse (configured mode). Run once over every labeled image and
-     cached to JSON, so CV folds never re-run YOLO.
-  2. One box per image, chosen WITHOUT ground truth: highest fused confidence (ties -> first
-     in fusion output order). The same rule is applied to training and test images.
-  3. Features = encode_features(bbox, image_shape); model = GBDTRegressor (scaler + 3 GBRs)
-     fitted on training-fold images only, never saved to disk.
+  1. Box extraction = the shipped inference path (scripts/localize_drones.py and train_gbdt.py):
+     DroneDetector.detect -> DroneDetector.best_box, i.e. morphology candidates, YOLO on the raw
+     frame (crops or full frame per config), OSD/foliage zones, morphology confirmation, tight
+     fallback boxes. Run once over every labeled image and cached to JSON, so CV folds never
+     re-run YOLO.
+  2. One box per image, chosen WITHOUT ground truth (best_box priority: confirmed YOLO >
+     standalone YOLO > best-shaped morphology candidate). Same rule for training and test images.
+  3. Features = encode_features(bbox, image_shape); model = GeoLocalizer (configured
+     formulation) fitted on training-fold images only, never saved to disk.
   4. Folds are assigned over ALL labeled images (detected or not). Test images without a
      detection are reported separately and also scored with a GT-free fallback prediction
      (the training-fold mean lat/lon/alt), so they are never dropped silently.
@@ -29,12 +30,14 @@ import pandas as pd
 from sklearn.model_selection import KFold
 
 from defense.config import load_config, get_camera_config, get_detection_config, get_localization_config
-from defense.detection import YoloDetector, ImageProcessor
-from defense.localization import GBDTRegressor, FusionEngine, encode_features, evaluate_localization
+from defense.detection import build_drone_detector
+from defense.localization import GeoLocalizer, FusionEngine, encode_features, evaluate_localization
 from defense.utils.geometry import EARTH_RADIUS_M, haversine_distance, bearing
 from defense.utils.logger import log
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+# Set in main(): camera config and model formulation used by every fold's GeoLocalizer
+LOCALIZER = {"camera": None, "formulation": "polar"}
 DEG = math.pi / 180.0
 
 
@@ -119,8 +122,7 @@ def _det_to_json(d: dict) -> dict:
 def build_cache_meta(records, det_cfg, loc_cfg, yolo_path, confidence, fusion_mode) -> dict:
     return {
         "cache_version": CACHE_VERSION,
-        "box_path": "scripts/localize_drones.py: ImageProcessor.process -> clean_image -> "
-                    "YoloDetector.detect(clean) -> OSD/foliage filter -> FusionEngine.fuse",
+        "box_path": "DroneDetector.detect -> DroneDetector.best_box (shared by localize_drones.py / train_gbdt.py)",
         "yolo_model": str(yolo_path),
         "yolo_sha256": _file_sha256(yolo_path),
         "confidence": float(confidence),
@@ -133,8 +135,8 @@ def build_cache_meta(records, det_cfg, loc_cfg, yolo_path, confidence, fusion_mo
 
 
 def run_detection(records, det_cfg, loc_cfg, yolo_path, confidence, fusion_mode) -> dict:
-    detector = YoloDetector(model_path=yolo_path, confidence=confidence, device=det_cfg.get("device", "cpu"))
-    image_processor = ImageProcessor(det_cfg)
+    cfg = dict(det_cfg, confidence=confidence)
+    detector = build_drone_detector(cfg, yolo_path=yolo_path)
     fusion_engine = FusionEngine(mode=fusion_mode, **_fusion_params(loc_cfg))
 
     per_image = {}
@@ -145,28 +147,23 @@ def run_detection(records, det_cfg, loc_cfg, yolo_path, confidence, fusion_mode)
             per_image[rec["image"]] = {"read_ok": False}
             continue
 
-        _, seg_candidates = image_processor.process(img)
-        clean_img = image_processor.clean_image(img, seg_candidates)
-        yolo_raw = detector.detect(clean_img)
-        for d in yolo_raw:
-            d["source"] = "yolo"
-
+        result = detector.detect(img)
+        bbox, source, score = detector.best_box(result, fusion_engine, img.shape[:2])
         ih, iw = img.shape[:2]
-        # Same hard-coded OSD / foliage filter as scripts/localize_drones.py
-        yolo_kept = [
-            d for d in yolo_raw
-            if not (d["center_y"] < 120 and d["center_x"] > 0.60 * iw)
-            and not (d["center_y"] > 0.88 * ih)
-        ]
-        fused = fusion_engine.fuse(seg_candidates, yolo_kept, image_shape=img.shape[:2])
+        chosen = []
+        if bbox is not None:
+            x, y, w, h = bbox
+            chosen = [{"center_x": x + w / 2.0, "center_y": y + h / 2.0, "width": w, "height": h,
+                       "confidence": score, "source": source}]
 
         per_image[rec["image"]] = {
             "read_ok": True,
             "shape": [int(ih), int(iw)],
-            "seg_candidates": [[int(v) for v in c] for c in seg_candidates],
-            "yolo_raw": [_det_to_json(d) for d in yolo_raw],
-            "yolo_kept": [_det_to_json(d) for d in yolo_kept],
-            "fused": [_det_to_json(d) for d in fused],  # seg-only boxes carry source="seg"
+            "seg_candidates": [[int(v) for v in c] for c in result["seg_candidates"]],
+            "n_candidates": len(result["seg_candidates"]) + sum(1 for d in result["yolo"] if d["source"] == "yolo"),
+            "yolo_raw": [_det_to_json(dict(d, source="yolo")) for d in result["yolo_raw"]],
+            "yolo_kept": [_det_to_json(d) for d in result["yolo"]],
+            "fused": [_det_to_json(d) for d in chosen],  # the single best_box choice
         }
         if i % 25 == 0 or i == len(records):
             log("CV-Detect", f"Processed {i}/{len(records)} images")
@@ -273,7 +270,8 @@ def _fold_summary(fold_metrics: list[dict], key: str) -> dict:
 # Cross-validation
 # ----------------------------------------------------------------------------------------
 def fit_predict(X, Y, train_idx, test_idx, hp):
-    reg = GBDTRegressor()  # save() is never called: fold models stay in memory only
+    # save() is never called: fold models stay in memory only
+    reg = GeoLocalizer(LOCALIZER["camera"], formulation=LOCALIZER["formulation"])
     reg.train(X[train_idx], {"lat": Y[train_idx, 0], "lon": Y[train_idx, 1], "alt": Y[train_idx, 2]}, **hp)
     if len(test_idx) == 0:
         return np.zeros((0, 3))
@@ -496,6 +494,8 @@ def main():
     parser.add_argument("--yolo-model", type=str, default=None, help="Path to YOLO model (.pt)")
     parser.add_argument("--conf", type=float, default=None, help="YOLO confidence threshold")
     parser.add_argument("--fusion", type=str, default=None, help="Fusion mode: adaptive, filter, soft, hard, yolo, seg")
+    parser.add_argument("--formulation", type=str, default=None, choices=["polar", "hybrid"],
+                        help="GeoLocalizer formulation (defaults to config localization.model_formulation)")
     parser.add_argument("--folds", type=int, default=5, help="Number of folds / contiguous blocks")
     parser.add_argument("--seed", type=int, default=42, help="KFold shuffle random_state")
     parser.add_argument("--extra-seeds", type=int, default=10,
@@ -515,7 +515,9 @@ def main():
     cam = {"lat": float(cam_cfg["latitude"]), "lon": float(cam_cfg["longitude"]), "alt": float(cam_cfg["altitude"])}
 
     yolo_path = args.yolo_model or det_cfg.get("yolo_model_path", "models/yolo11n-obb.pt")
-    confidence = args.conf if args.conf is not None else float(det_cfg.get("confidence", 0.50))
+    confidence = args.conf if args.conf is not None else float(det_cfg.get("confidence", 0.40))
+    LOCALIZER["camera"] = cam_cfg
+    LOCALIZER["formulation"] = args.formulation or loc_cfg.get("model_formulation", "polar")
     fusion_mode = args.fusion or loc_cfg.get("fusion_mode", "adaptive")
     hp = {
         "n_estimators": int(loc_cfg.get("n_estimators", 200)),
@@ -533,7 +535,7 @@ def main():
     log("CV", "📊 Cross-Validated Drone Geo-Localization")
     log("CV", f"Config: {args.config or 'config/default.yaml'}")
     log("CV", f"Data: {data_dir} | YOLO: {yolo_path} (conf={confidence}) | Fusion: {fusion_mode}")
-    log("CV", f"GBDT hyperparameters: {hp}")
+    log("CV", f"Localizer: GeoLocalizer[{LOCALIZER['formulation']}] | GBDT hyperparameters: {hp}")
 
     # 1. Ground truth -------------------------------------------------------------------
     records = load_ground_truth(data_dir)
@@ -567,7 +569,7 @@ def main():
         if not info.get("read_ok"):
             continue
         fused = info["fused"]
-        n_fused[i] = len(fused)
+        n_fused[i] = info.get("n_candidates", len(fused))
         n_yolo_kept[i] = len(info["yolo_kept"])
         det = select_box(fused)
         if det is None:
@@ -593,10 +595,12 @@ def main():
         "n_with_multiple_fused_detections": int((n_fused >= 2).sum()),
         "fused_detection_count_histogram": {str(k): int((n_fused == k).sum()) for k in sorted(set(n_fused.tolist()))},
         "n_with_multiple_yolo_after_filter": int((n_yolo_kept >= 2).sum()),
-        "chosen_box_source": {"yolo": int((box_source == "yolo").sum()), "seg_only_morphology": int((box_source == "seg").sum())},
+        "chosen_box_source": {"yolo_confirmed_by_morphology": int((box_source == "yolo+seg").sum()),
+                              "yolo_standalone": int((box_source == "yolo").sum()),
+                              "morphology_tight_box": int((box_source == "seg").sum())},
         "n_no_detection": int((~has_box).sum()),
         "no_detection_images": [evaluable[i]["image"] for i in np.where(~has_box)[0]],
-        "selection_rule": "highest fused confidence among FusionEngine outputs (ties -> first in fusion order); "
+        "selection_rule": "DroneDetector.best_box: confirmed YOLO > standalone YOLO > best-shaped candidate; "
                           "applied identically to training and test images; no ground truth used",
     }
     log("CV", f"Coverage: {coverage['n_with_ge1_fused_detection']}/{n} images with >=1 fused detection, "
@@ -672,7 +676,7 @@ def main():
 
     # 6. Diagnostics --------------------------------------------------------------------
     groups = {
-        "chosen_box_yolo": has_box & (box_source == "yolo"),
+        "chosen_box_yolo": has_box & np.isin(box_source, ["yolo", "yolo+seg"]),
         "chosen_box_seg_only": has_box & (box_source == "seg"),
         "single_fused_detection": has_box & (n_fused == 1),
         "multiple_fused_detections": has_box & (n_fused >= 2),
@@ -718,7 +722,7 @@ def main():
             "fusion_mode": det_meta.get("fusion_mode"),
             "selection_rule": coverage["selection_rule"],
             "features": "defense.localization.encode_features(bbox_xywh, image_shape) -> 20 dims",
-            "model": "defense.localization.GBDTRegressor (StandardScaler + 3 GradientBoostingRegressor, random_state=42), "
+            "model": f"defense.localization.GeoLocalizer(formulation={LOCALIZER['formulation']!r}), "
                      "fitted on training-fold images with a detection only",
             "gbdt_hyperparameters": hp,
             "camera": cam,
