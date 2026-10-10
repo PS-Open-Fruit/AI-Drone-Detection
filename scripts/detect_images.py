@@ -4,7 +4,7 @@ import time
 import pandas as pd
 import cv2
 from defense.config import load_config, get_detection_config
-from defense.detection import YoloDetector, SahiDetector, ImageProcessor
+from defense.detection import YoloDetector, SahiDetector, ImageProcessor, DroneDetector
 from defense.utils.logger import log
 
 def main():
@@ -25,7 +25,9 @@ def main():
     det_cfg = get_detection_config(cfg)
 
     model_path = args.model or det_cfg.get("yolo_model_path", "models/yolo11n-obb.pt")
-    confidence = args.conf if args.conf is not None else float(det_cfg.get("confidence", 0.50))
+    if args.conf is not None:
+        det_cfg["confidence"] = args.conf
+    confidence = float(det_cfg.get("confidence", 0.40))
     device = args.device or det_cfg.get("device", "cpu")
 
     test_dir = Path(args.test_dir)
@@ -56,6 +58,9 @@ def main():
         )
     else:
         detector = YoloDetector(model_path=model_path, confidence=confidence, device=device)
+    if args.use_sahi:
+        det_cfg["yolo_mode"] = "frame"  # SAHI slices the whole frame itself
+    drone_detector = DroneDetector(image_processor, detector, det_cfg)
 
     start_time = time.time()
     records = []
@@ -66,17 +71,8 @@ def main():
             log("Detection", f"❌ Failed to process {img_path.name}: image could not be loaded")
             continue
 
-        mask, cands = image_processor.process(img)
-        clean_img = image_processor.clean_image(img, cands)
-        dets = detector.detect(clean_img)
-
-        # Spatial filter: exclude detections in camera timestamp and foliage exclusion zones
-        ih, iw = img.shape[:2]
-        dets = [
-            d for d in dets
-            if not (d["center_y"] < 120 and d["center_x"] > 0.60 * iw)
-            and not (d["center_y"] > 0.88 * ih)
-        ]
+        # Shared detection path: YOLO on the raw frame, exclusion zones, morphology confirmation
+        dets = drone_detector.detect(img)["yolo"]
 
         log("Detection", f"Processing image {idx}/{len(image_paths)}: {img_path.name} → {len(dets)} drones")
 
