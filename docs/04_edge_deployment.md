@@ -51,7 +51,7 @@ graph LR
 **Setup:** `scripts/benchmark_pipeline.py` times the real tracking pipeline (`config/default.yaml`) stage by stage, on a **desktop Intel Core i5-14500 CPU (Windows 11, no GPU)** over 1080p, 25 fps competition footage.
 - **Runs:** each run is a fresh process; the first 20 frames are excluded as warm-up.
 - **Before vs after:** the previous pipeline (commit `839dcdd`, from a git worktree) and the current one ran back to back on the same videos, 2 runs × 600 frames each.
-- **This is not a Raspberry Pi 5 measurement**; see §1.3.
+- **This is not a Raspberry Pi 5 measurement**; the Pi results are in §1.3.
 
 | Video | Before (`clean_image` → YOLO 640 on the whole frame) | **After** (YOLO on 320 px raw crops around candidates) | Speed-up |
 | :--- | :---: | :---: | :---: |
@@ -78,32 +78,57 @@ graph LR
 - The machine was not fully idle (mean background load 12% during the "before" runs, 5.5% during the "after" runs).
 - One "before" run on `P1_VIDEO_5` was visibly disturbed (8.3 FPS against 11.2 FPS). The table uses medians pooled over all frames, which are robust to that.
 
-**NCNN backend.** The detector can also be exported to NCNN, the fastest CPU backend Ultralytics supports on ARM. On the held-out detection set the NCNN export gives identical results (F1 0.947, 39/43 counts). On this x86 desktop it is about as fast as PyTorch (13.5 vs 14.3 ms per 320 px crop); its advantage is expected on the Pi's ARM cores, and §1.3 measures that.
+**NCNN backend.** The detector can also be exported to NCNN, the fastest CPU backend Ultralytics supports on ARM. On the held-out detection set the NCNN export gives identical results (F1 0.947, 39/43 counts). On this x86 desktop it is about as fast as PyTorch (13.5 vs 14.3 ms per 320 px crop); on the Pi's ARM cores it is about 6.7× faster (§1.3).
 
-### 1.3 Measuring on a Raspberry Pi 5
-These steps reproduce the benchmark on the target board. Use Raspberry Pi OS 64-bit and an active cooler: without one, the Pi 5 throttles under sustained load. The benchmark records the SoC temperature and `vcgencmd get_throttled` before and after the runs, so a throttled result is visible in the JSON.
+### 1.3 Measured on a Raspberry Pi 5
+**Board:** Raspberry Pi 5 Model B, 8 GB, 4× Cortex-A76 at up to 2.4 GHz, official active cooler, Debian 13 (Raspberry Pi OS), Python 3.13, CPU only.
+- **Software:** torch 2.14.1+cpu, ultralytics 8.4.157, OpenCV 5.0, ncnn 1.0.20260526.
+- **Protocol:** same benchmark and settings as §1.2, 2 runs × 600 frames per video and backend, first 20 frames excluded.
+- **Conditions:** background CPU load before the runs was 0.1–0.5%. The SoC stayed at 52–60 °C, and `vcgencmd get_throttled` reported `0x0` (never throttled) before and after.
+
+| 1080p video | PyTorch (`yolo11n-obb.pt`) | **NCNN** (`yolo11n-obb_ncnn_model`, 320 px) |
+| :--- | :---: | :---: |
+| `P1_VIDEO_5` (2 drones) | 3.9 FPS (255 ms/frame) | **12.5 FPS** (77 ms/frame, p95 91 ms) |
+| `P1_VIDEO_4` (1 drone) | 6.6 FPS (145 ms/frame) | **16.9 FPS** (56 ms/frame, p95 74 ms) |
+
+| Stage (median ms per frame, `P1_VIDEO_5`, NCNN) | ms |
+| :--- | :---: |
+| Video decode (1080p H.264, CPU) | 3.3 |
+| Grayscale + threshold | 2.4 |
+| Morphology | 9.6 |
+| YOLO11n-OBB, 2 crops (≈ 16 ms each) | 38.7 |
+| Tracking + fusion | 0.4 |
+| Localization (GBDT, 2 tracks) | 2.8 |
+| HUD render | 1.4 |
+| Video write (mp4v, 1080p) | 17.8 |
+
+**Takeaways:**
+- **NCNN is essential on the Pi.** It makes YOLO about 6.7× faster per crop than PyTorch (16 against 105 ms) and the whole pipeline 2.6–3.2× faster. Accuracy is unchanged: on the Pi, the held-out detection F1 (0.947) and count accuracy (39/43) are identical for both backends and match the desktop.
+- **Writing the annotated 1080p video is the second-largest cost** (about 18 ms). A deployment that only sends First Alert telemetry would not pay it.
+- **Not full frame rate.** The source video is 25 fps, so the Pi processes about half to two-thirds of the frames in real time. Cost grows with the number of drone-like candidates in view.
+
+**Reproduce:**
 
 ```bash
-# On the Pi
+# On the Pi (no sudo needed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone <this repository> && cd AI-Drone-Detection   # check out the branch being measured
-uv sync --extra edge
+uv sync --extra edge                                    # CPU-only torch on ARM (~1.4 GB environment)
 
-# From the PC: copy the detector, the trained localizer and one test video (not in git)
+# From the PC: copy the detector, the trained localizer and a test video (not in git)
 scp models/yolo11n-obb.pt models/geo_localizer.bin <user>@<pi>:~/AI-Drone-Detection/models/
 scp data/p3_video/P1_VIDEO_5.mp4 <user>@<pi>:~/AI-Drone-Detection/data/p3_video/
 
 # On the Pi: export the detector to NCNN once (320 px input = the crop size)
 uv run python -c "from ultralytics import YOLO; YOLO('models/yolo11n-obb.pt').export(format='ncnn', imgsz=320)"
 
-# Benchmark both backends (300 frames, 2 runs each)
-uv run python scripts/benchmark_pipeline.py data/p3_video/P1_VIDEO_5.mp4 --max-frames 300 \
-    --threads default --repeats 2 --output data/bench_pi_torch.json
-uv run python scripts/benchmark_pipeline.py data/p3_video/P1_VIDEO_5.mp4 --max-frames 300 \
-    --threads default --repeats 2 --yolo-model models/yolo11n-obb_ncnn_model --output data/bench_pi_ncnn.json
+# Track with NCNN, or benchmark
+uv run python scripts/track_video.py data/p3_video/P1_VIDEO_5.mp4 -o out.mp4 --yolo-model models/yolo11n-obb_ncnn_model
+uv run python scripts/benchmark_pipeline.py data/p3_video/P1_VIDEO_5.mp4 --threads default --repeats 2 \
+    --yolo-model models/yolo11n-obb_ncnn_model --output data/bench_pi_ncnn.json
 ```
 
-Expect video decode and video write to cost far more than on the desktop. The Pi 5 has no hardware H.264 decoder, so 1080p H.264 is decoded on the CPU.
+The benchmark records the board model, SoC temperature and throttling flags, so a throttled run is visible in its JSON.
 
 ---
 

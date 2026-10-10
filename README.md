@@ -12,7 +12,7 @@ A drone detection, geolocation, and multi-object tracking pipeline built for the
 - **Localization:** each confirmed drone's latitude, longitude, and altitude are estimated from its image geometry with gradient-boosted decision trees (GBDT).
 - **Output:** a HUD overlay plus a First Alert telemetry payload.
 
-The design targets CPU-only edge hardware (Raspberry Pi 5, no AI accelerator).
+It runs on CPU-only edge hardware: **12.5–16.9 FPS on a Raspberry Pi 5** (1080p input, NCNN backend, no AI accelerator).
 
 This repository is a cleaned-up, unit-tested reimplementation of the original competition code, with the detection and localization bugs found during evaluation fixed. [Results](#results) states where each figure comes from and what it was evaluated on.
 
@@ -101,7 +101,8 @@ uv run pytest tests/ -v
 | **Drone counting** (Problem 1) | Exact per-image count accuracy | 62.8% (27/43) | **90.7%** (39/43) | 43 labeled sample images in no training or validation split |
 | **Localization** (Problem 2) | Competition weighted error (0.70 × angle + 0.15 × height + 0.15 × range; lower is better) | 8.84 | **6.96** (angle 5.2°, height 7.8 m, range 14.6 m) | Blocked 5-fold CV over all 438 labeled images; misses scored with a fallback. `scripts/cv_localization.py` |
 | **Tracking** (Problem 3) | False tracks / frames showing a wrong drone count | 9 / 21.2% (`P1_VIDEO_4`)<br>3 / 7.7% (`P1_VIDEO_5`) | **2 / 5.2%**<br>**0 / 0.0%** | Full competition videos with 1 and 2 drones (manually verified constant). Real drones stay tracked in 100% of frames in both versions |
-| **Throughput** | End-to-end FPS, 1080p video | 11.0–11.4 FPS | **19.4–28.0 FPS** | Desktop Intel Core i5-14500 CPU, no GPU, same videos back to back. **Not a Raspberry Pi measurement.** `scripts/benchmark_pipeline.py` |
+| **Throughput, desktop** | End-to-end FPS, 1080p video | 11.0–11.4 FPS | **19.4–28.0 FPS** | Desktop Intel Core i5-14500 CPU, no GPU, same videos back to back. `scripts/benchmark_pipeline.py` |
+| **Throughput, Raspberry Pi 5** | End-to-end FPS, 1080p video | — | **12.5–16.9 FPS** (NCNN)<br>3.9–6.6 FPS (PyTorch) | Pi 5 8 GB, CPU only, active cooler, no throttling; includes writing the annotated video. Same held-out accuracy as the desktop for both backends. [`docs/04`](docs/04_edge_deployment.md) §1.3 |
 
 **What changed:**
 - **The detector no longer runs on a dimmed copy of the frame.** The old pre-YOLO cleaning step blinded it: on the held-out frames it found none of the drones.
@@ -118,12 +119,11 @@ Details, ablations, and caveats are in [`docs/01_object_detection.md`](docs/01_o
 - **Why blocked CV is the headline.** The localization images are consecutive frames of 4–5 flights, so blocked CV holds out whole flight segments. Random 5-fold CV gives 3.53 (was 4.79) but mostly measures interpolation between near-duplicate frames.
 - **Not measured:**
   - ID switches, MOTA, and IDF1 (no tracking ground truth).
-  - Speed on the Raspberry Pi 5. Step-by-step instructions for measuring it, including the NCNN backend, are in [`docs/04_edge_deployment.md`](docs/04_edge_deployment.md) §1.3.
   - The First Alert payload's `velocity_mps` and `direction_deg`, which are not computed yet and are sent as `null`.
 - **Archive figures are optimistic.** The original competition archive reports a 3.33 localization error and a 2.93 m altitude error. Those are a training-set score and a random split over sequential frames (docs/02 §5.1–5.3).
 
 **Hardware:**
-- **Deployment target**: Raspberry Pi 5 (ARM Cortex-A76 CPU, 4GB/8GB RAM, no dedicated GPU or AI accelerator). The nano detector, crop-based inference, and tree-based regressors were chosen for this budget.
+- **Deployment target**: Raspberry Pi 5 (ARM Cortex-A76 CPU, 4GB/8GB RAM, no dedicated GPU or AI accelerator). The nano detector, crop-based inference, NCNN runtime, and tree-based regressors were chosen for this budget. It does not reach the source video's 25 fps, so about half to two-thirds of the frames are processed live.
 - **Training**: CUDA GPU.
 
 ---
