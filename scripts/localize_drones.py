@@ -3,19 +3,19 @@ from pathlib import Path
 import time
 import pandas as pd
 import cv2
-from defense.config import load_config, get_detection_config, get_localization_config
-from defense.detection import YoloDetector, ImageProcessor
-from defense.localization import GBDTRegressor, FusionEngine, encode_features
+from defense.config import load_config, get_detection_config, get_localization_config, get_camera_config
+from defense.detection import build_drone_detector
+from defense.localization import GeoLocalizer, FusionEngine, encode_features
 from defense.utils.logger import log
 
 def main():
     parser = argparse.ArgumentParser(description="Drone Localization — Full Detection + Geo-Regression Pipeline")
     parser.add_argument("--src", type=str, required=True, help="Input directory of images")
     parser.add_argument("--yolo-model", type=str, default=None, help="Path to YOLO model (.pt)")
-    parser.add_argument("--gbdt-models", type=str, default=None, help="Directory containing GBDT models")
+    parser.add_argument("--models-dir", "--gbdt-models", dest="models_dir", type=str, default=None,
+                        help="Directory containing the trained localizer (geo_localizer.bin)")
     parser.add_argument("--output", type=str, required=True, help="Output CSV path")
-    parser.add_argument("--fusion", type=str, default=None, help="Fusion mode: adaptive, filter, soft, hard, yolo, seg")
-    parser.add_argument("--conf", type=float, default=None, help="Confidence threshold")
+    parser.add_argument("--conf", type=float, default=None, help="YOLO confirmation confidence threshold")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config")
 
     args = parser.parse_args()
@@ -23,11 +23,9 @@ def main():
     cfg = load_config(args.config)
     det_cfg = get_detection_config(cfg)
     loc_cfg = get_localization_config(cfg)
-
-    yolo_path = args.yolo_model or det_cfg.get("yolo_model_path", "models/yolo11n-obb.pt")
-    gbdt_dir = args.gbdt_models or loc_cfg.get("gbdt_models_dir", "models/")
-    fusion_mode = args.fusion or loc_cfg.get("fusion_mode", "adaptive")
-    confidence = args.conf if args.conf is not None else float(det_cfg.get("confidence", 0.75))
+    if args.conf is not None:
+        det_cfg["confidence"] = args.conf
+    models_dir = args.models_dir or loc_cfg.get("models_dir", "models/")
 
     src_dir = Path(args.src)
     if not src_dir.exists():
@@ -38,28 +36,16 @@ def main():
     # Startup Banner
     log("Defense", "📍 Drone Localization — Detection + Geo-Regression")
     log("Defense", f"Config: {args.config or 'config/default.yaml'}")
-    log("Defense", f"YOLO: {yolo_path} | GBDT: {gbdt_dir}")
-    log("Defense", f"Input: {src_dir} ({len(image_paths)} images found)")
-    log("Defense", f"Fusion mode: {fusion_mode}, Confidence: {confidence}")
+    log("Defense", f"Localizer: {models_dir} | Input: {src_dir} ({len(image_paths)} images found)")
 
-    detector = YoloDetector(model_path=yolo_path, confidence=confidence, device=det_cfg.get("device", "cpu"))
-    image_processor = ImageProcessor(det_cfg)
-    localizer = GBDTRegressor(models_dir=gbdt_dir)
+    detector = build_drone_detector(det_cfg, yolo_path=args.yolo_model)
+    fusion_engine = FusionEngine.from_config(loc_cfg)
+    localizer = GeoLocalizer(get_camera_config(cfg), models_dir=models_dir)
     localizer.load()
-    fusion_engine = FusionEngine(
-        mode=fusion_mode,
-        iou_weight=loc_cfg.get("iou_weight", 0.60),
-        shape_weight=loc_cfg.get("shape_weight", 0.30),
-        motion_weight=loc_cfg.get("motion_weight", 0.10),
-        soft_threshold=loc_cfg.get("soft_threshold", 0.25),
-        area_ratio_min=loc_cfg.get("area_ratio_min", 0.00005),
-        area_ratio_max=loc_cfg.get("area_ratio_max", 0.003),
-        aspect_ratio_min=loc_cfg.get("aspect_ratio_min", 0.4),
-        aspect_ratio_max=loc_cfg.get("aspect_ratio_max", 3.0),
-    )
 
     start_time = time.time()
     records = []
+    n_fallback = 0
 
     for idx, img_path in enumerate(image_paths, 1):
         img = cv2.imread(str(img_path))
@@ -67,41 +53,24 @@ def main():
             log("Localize", f"❌ Failed to read {img_path.name}")
             continue
 
-        _, seg_candidates = image_processor.process(img)
-        clean_img = image_processor.clean_image(img, seg_candidates)
-        yolo_dets = detector.detect(clean_img)
-
-        ih, iw = img.shape[:2]
-        yolo_dets = [
-            d for d in yolo_dets
-            if not (d["center_y"] < 120 and d["center_x"] > 0.60 * iw)
-            and not (d["center_y"] > 0.88 * ih)
-        ]
-
-        fused = fusion_engine.fuse(seg_candidates, yolo_dets, image_shape=img.shape[:2])
-
-        if fused:
-            for det in fused:
-                cx = det["center_x"]
-                cy = det["center_y"]
-                w = det["width"]
-                h = det["height"]
-                bbox = (int(round(cx - w / 2.0)), int(round(cy - h / 2.0)), int(round(w)), int(round(h)))
-                feats = encode_features(bbox, img.shape[:2])
-                pred = localizer.predict(feats)
-                lat = float(pred["lat"])
-                lon = float(pred["lon"])
-                alt = float(pred["alt"])
-
-                records.append({
-                    "ImageName": img_path.name,
-                    "Latitude": lat,
-                    "Longitude": lon,
-                    "Altitude": alt,
-                })
-                log("Localize", f"Image {idx}/{len(image_paths)}: {img_path.name} → 1 drone: lat={lat:.5f}, lon={lon:.5f}, alt={alt:.2f}m")
+        # One drone per image: the single most likely box (same rule used for training)
+        result = detector.detect(img)
+        bbox, source, _ = detector.best_box(result, fusion_engine, img.shape[:2])
+        if bbox is not None:
+            pred = localizer.predict(encode_features(bbox, img.shape[:2]))
         else:
-            log("Localize", f"Image {idx}/{len(image_paths)}: {img_path.name} → 0 drones detected")
+            pred = localizer.fallback
+            n_fallback += 1
+            source = "fallback (no detection)"
+
+        records.append({
+            "ImageName": img_path.name,
+            "Latitude": float(pred["lat"]),
+            "Longitude": float(pred["lon"]),
+            "Altitude": float(pred["alt"]),
+        })
+        log("Localize", f"Image {idx}/{len(image_paths)}: {img_path.name} [{source}] → "
+                        f"lat={pred['lat']:.5f}, lon={pred['lon']:.5f}, alt={pred['alt']:.2f}m")
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,7 +80,7 @@ def main():
     elapsed = time.time() - start_time
     log("Defense", "✅ Localization complete!")
     log("Defense", f"Processed {len(image_paths)} images in {elapsed:.1f}s")
-    log("Defense", f"Localized {len(records)} drones")
+    log("Defense", f"Localized {len(records) - n_fallback} drones; {n_fallback} images used the fallback position")
     log("Defense", f"Output: {out_path}")
 
 if __name__ == "__main__":
