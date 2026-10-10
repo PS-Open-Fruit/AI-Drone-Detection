@@ -10,11 +10,11 @@ class VideoTracker:
     def __init__(self, detector, localizer, fusion_engine, config: dict, image_processor=None):
         """
         Args:
-            detector: YoloDetector or SahiDetector (or None)
-            localizer: GBDTRegressor (or None)
+            detector: DroneDetector (or None)
+            localizer: GeoLocalizer / GBDTRegressor (or None)
             fusion_engine: FusionEngine
             config: tracking section from YAML config
-            image_processor: ImageProcessor (optional)
+            image_processor: ImageProcessor, used for morphology-only tracking when detector is None
         """
         self.detector = detector
         self.localizer = localizer
@@ -25,6 +25,11 @@ class VideoTracker:
         self.max_distance = float(cfg.get("max_distance_threshold", 100))
         self.min_confirm = int(cfg.get("min_track_confidence", 3))
         self.track_memory = int(cfg.get("track_memory", 30))
+        # Morphology alone also fires on birds and specks: let it sustain existing tracks, but only start
+        # a new track from a detection that YOLO produced.
+        # (Only meaningful when a YOLO model is loaded; morphology-only tracking keeps creating tracks.)
+        self.require_yolo_for_new_tracks = (bool(cfg.get("require_yolo_for_new_tracks", True))
+                                            and getattr(detector, "yolo", None) is not None)
 
         self.tracks: list[DroneTrack] = []
         self.next_id: int = 1
@@ -45,23 +50,17 @@ class VideoTracker:
         """
         self.frame_count += 1
 
-        # 1. Detection
+        # 1. Detection (DroneDetector: morphology + YOLO on the raw frame, exclusion zones, confirmation)
         seg_candidates = []
         binary_mask = None
-        clean_frame = frame
-        if self.image_processor is not None:
-            binary_mask, seg_candidates = self.image_processor.process(frame)
-            clean_frame = self.image_processor.clean_image(frame, seg_candidates)
-
         yolo_detections = []
         if self.detector is not None:
-            yolo_detections = self.detector.detect(clean_frame)
-            ih, iw = frame.shape[:2]
-            yolo_detections = [
-                d for d in yolo_detections
-                if not (d["center_y"] < 120 and d["center_x"] > 0.60 * iw)
-                and not (d["center_y"] > 0.88 * ih)
-            ]
+            det = self.detector.detect(frame)
+            binary_mask = det["mask"]
+            seg_candidates = det["seg_boxes"]
+            yolo_detections = det["yolo"]
+        elif self.image_processor is not None:
+            binary_mask, seg_candidates = self.image_processor.process(frame)
 
         # 2. Candidate fusion
         prev_centroids = [t.centroid for t in self.tracks if not t.is_dead]
@@ -105,6 +104,9 @@ class VideoTracker:
             h = det["height"]
             bbox = (int(round(cx - w / 2.0)), int(round(cy - h / 2.0)), int(round(w)), int(round(h)))
             conf = det.get("confidence", 0.8)
+
+            if self.require_yolo_for_new_tracks and det.get("source") == "seg":
+                continue
 
             # Suppress track creation if too close to any existing track or newly added track
             too_close = False

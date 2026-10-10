@@ -28,9 +28,17 @@ detection:
   foliage_y_ratio: 0.88
   roi_padding: 25
 
-  # YOLO
+  # YOLO (runs on the RAW frame; see defense/detection/drone_detector.py)
   yolo_model_path: "models/yolo11n-obb.pt"
-  confidence: 0.50
+  confidence: 0.40          # min YOLO confidence for a box confirmed by a morphological candidate
+  standalone_conf: none     # unconfirmed YOLO boxes kept only above this (none = never; static scene
+                            # objects score 0.5-0.7 on every frame of this camera)
+  yolo_mode: "crops"        # crops: native-resolution crops around candidates (fast on CPU)
+                            # frame: whole frame at yolo_imgsz (finds drones morphology misses)
+  crop_size: 320
+  yolo_imgsz: 1280
+  confirm_margin: 30        # px around a candidate within which a YOLO centre counts as confirming
+  tight_boxes: true         # unconfirmed candidates use the dark-pixel extent, not the dilated blob
   device: "cpu"             # "cpu", "cuda", "0", etc.
 
   # SAHI
@@ -40,7 +48,9 @@ detection:
 
 # === Module 2: Localization ===
 localization:
-  gbdt_models_dir: "models/"    # expects lat.bin, lon.bin, alt.bin inside
+  models_dir: "models/"         # expects geo_localizer.bin (scripts/train_gbdt.py)
+  model_formulation: "polar"    # polar: GBDTs on bearing / log distance / height
+                                # hybrid: linear bearing + elevation, GBDT distance
   # GBDT hyperparameters (for training)
   n_estimators: 200
   learning_rate: 0.1
@@ -65,6 +75,7 @@ tracking:
   min_track_confidence: 3       # frames before a track is confirmed
   track_memory: 30              # frames to keep a lost track alive
   max_distance_threshold: 100   # pixels for association gating
+  require_yolo_for_new_tracks: true  # morphology-only candidates may extend tracks but not start them
 
 # === Telemetry ===
 telemetry:

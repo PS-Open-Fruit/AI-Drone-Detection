@@ -9,8 +9,8 @@ from defense.config import (
     get_tracking_config,
     get_camera_config,
 )
-from defense.detection import YoloDetector, ImageProcessor
-from defense.localization import GBDTRegressor, FusionEngine
+from defense.detection import build_drone_detector
+from defense.localization import GeoLocalizer, FusionEngine
 from defense.tracking import VideoTracker, HUDRenderer, TelemetryDispatcher
 from defense.utils.video_io import open_video, get_video_info, create_video_writer
 from defense.utils.logger import log
@@ -20,7 +20,8 @@ def main():
     parser.add_argument("input_video", type=str, help="Path to input video (.mp4, .avi, etc.)")
     parser.add_argument("-o", "--output", type=str, required=True, help="Path to output annotated video")
     parser.add_argument("--yolo-model", type=str, default=None, help="Path to YOLO model (.pt)")
-    parser.add_argument("--gbdt-models", type=str, default=None, help="Directory containing GBDT models")
+    parser.add_argument("--models-dir", "--gbdt-models", dest="gbdt_models", type=str, default=None,
+                        help="Directory containing the trained localizer (geo_localizer.bin)")
     parser.add_argument("--fusion", type=str, default=None, help="Fusion mode: adaptive, filter, soft, hard, yolo, seg")
     parser.add_argument("--conf", type=float, default=None, help="Confidence threshold")
     parser.add_argument("--debug", type=str, default=None, help="Directory to save 5-stage intermediate debug frames")
@@ -38,9 +39,11 @@ def main():
     tel_cfg = cfg.get("telemetry", {})
 
     yolo_path = args.yolo_model or det_cfg.get("yolo_model_path", "models/yolo11n-obb.pt")
-    gbdt_dir = args.gbdt_models or loc_cfg.get("gbdt_models_dir", "models/")
+    models_dir = args.gbdt_models or loc_cfg.get("models_dir", "models/")
     fusion_mode = args.fusion or loc_cfg.get("fusion_mode", "adaptive")
-    confidence = args.conf if args.conf is not None else float(det_cfg.get("confidence", 0.75))
+    if args.conf is not None:
+        det_cfg["confidence"] = args.conf
+    confidence = float(det_cfg.get("confidence", 0.40))
 
     cap = open_video(args.input_video)
     info = get_video_info(cap)
@@ -50,39 +53,24 @@ def main():
     frame_count = info["frame_count"]
 
     # Initialize components
-    detector = None
-    if Path(yolo_path).exists():
-        detector = YoloDetector(model_path=yolo_path, confidence=confidence, device=det_cfg.get("device", "cpu"))
-    else:
-        log("Defense", f"⚠️ YOLO weights not found at {yolo_path}. Proceeding with morphological segmentation only.")
+    detector = build_drone_detector(det_cfg, yolo_path=yolo_path)
+    image_processor = detector.image_processor
 
     localizer = None
     try:
-        localizer = GBDTRegressor(models_dir=gbdt_dir)
+        localizer = GeoLocalizer(cam_cfg, models_dir=models_dir)
         localizer.load()
     except Exception as e:
-        log("Defense", f"⚠️ GBDT models not loaded: {e}. Localization disabled on HUD.")
+        log("Defense", f"⚠️ Localizer not loaded: {e}. Localization disabled on HUD.")
         localizer = None
 
-    image_processor = ImageProcessor(det_cfg)
-    fusion_engine = FusionEngine(
-        mode=fusion_mode,
-        iou_weight=loc_cfg.get("iou_weight", 0.60),
-        shape_weight=loc_cfg.get("shape_weight", 0.30),
-        motion_weight=loc_cfg.get("motion_weight", 0.10),
-        soft_threshold=loc_cfg.get("soft_threshold", 0.25),
-        area_ratio_min=loc_cfg.get("area_ratio_min", 0.00005),
-        area_ratio_max=loc_cfg.get("area_ratio_max", 0.003),
-        aspect_ratio_min=loc_cfg.get("aspect_ratio_min", 0.4),
-        aspect_ratio_max=loc_cfg.get("aspect_ratio_max", 3.0),
-    )
+    fusion_engine = FusionEngine.from_config(loc_cfg, mode=fusion_mode)
 
     tracker = VideoTracker(
         detector=detector,
         localizer=localizer,
         fusion_engine=fusion_engine,
         config=trk_cfg,
-        image_processor=image_processor
     )
 
     hud = HUDRenderer()
@@ -108,7 +96,7 @@ def main():
     log("Defense", "🎯 Drone Video Tracker")
     log("Defense", f"Input: {args.input_video} ({width}x{height}, {fps:.1f} FPS, {frame_count} frames)")
     log("Defense", f"Output: {args.output}")
-    log("Defense", f"Model: {yolo_path} (conf={confidence})")
+    log("Defense", f"Model: {yolo_path} (conf={confidence}, yolo_mode={detector.yolo_mode})")
     log("Defense", f"Fusion: {fusion_mode} | Localization: {'enabled' if localizer else 'disabled'}")
 
     start_time = time.time()

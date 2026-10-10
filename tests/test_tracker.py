@@ -55,3 +55,31 @@ def test_tracker_colocated_track_merging():
     assert len(tracker.tracks) == 1
     assert tracker.tracks[0].track_id == 1
     assert tracker.tracks[0].confirmed
+
+
+def test_morphology_only_detections_extend_but_do_not_start_tracks():
+    """With YOLO loaded, a morphology-only (seg) detection must not create a track, but may sustain one."""
+    class FakeDetector:
+        yolo = object()
+
+        def detect(self, frame):
+            return {"mask": None, "seg_boxes": [], "yolo": []}
+
+    fusion = FusionEngine(mode="adaptive")
+    config = {"max_distance_threshold": 100, "min_track_confidence": 2, "track_memory": 10}
+    tracker = VideoTracker(detector=FakeDetector(), localizer=None, fusion_engine=fusion, config=config)
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    seg = {"center_x": 500, "center_y": 500, "width": 20, "height": 20, "confidence": 0.9, "polygon": None,
+           "source": "seg"}
+
+    tracker.fusion.fuse = lambda *args, **kwargs: [dict(seg)]
+    tracker.process_frame(frame)
+    assert tracker.tracks == []                       # a bird-like blob alone starts nothing
+
+    tracker.fusion.fuse = lambda *args, **kwargs: [dict(seg, source="yolo+seg")]
+    tracker.process_frame(frame)
+    assert len(tracker.tracks) == 1                   # YOLO evidence starts the track
+
+    tracker.fusion.fuse = lambda *args, **kwargs: [dict(seg, center_x=505)]
+    confirmed = tracker.process_frame(frame)
+    assert len(tracker.tracks) == 1 and len(confirmed) == 1   # morphology keeps it alive and confirms it
