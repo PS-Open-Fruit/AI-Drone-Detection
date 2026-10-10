@@ -93,7 +93,7 @@ uv run pytest tests/ -v
 
 ## Results
 
-> **Where these numbers come from.** Every "before / after" pair was measured with this repository's evaluation scripts on the same data. "Before" is the pipeline at commit `839dcdd`; "after" is the current code. Official competition scores were computed on a private test set (no public leaderboard) and are not available.
+> **Where these numbers come from.** Every "before / after" pair was measured with this repository's evaluation scripts on the same data. "Before" is commit `839dcdd`, the first reimplementation (YOLO on a dimmed, downscaled frame; GBDTs predicting lat/lon/alt directly). "After" is commit `09bdf99`; later commits may change these numbers. Official competition scores were computed on a private test set (no public leaderboard) and are not available.
 
 | Area | Metric (held out) | Before | **After** | Evaluated on |
 | :--- | :--- | :---: | :---: | :--- |
@@ -133,6 +133,8 @@ Details, ablations, and caveats are in [`docs/01_object_detection.md`](docs/01_o
 ```
 AI-Drone-Detection/
 ├── README.md
+├── AGENTS.md                           # Guide for coding agents (CLAUDE.md imports it)
+├── CLAUDE.md
 ├── LICENSE
 ├── IMPLEMENTATION_PLAN.md              # File-by-file reimplementation plan
 ├── pyproject.toml                      # Project config for uv
