@@ -102,7 +102,27 @@ Its **15-image test split was never used for training or checkpoint selection**.
 | Competition F1, IoU ≥ 0.25, conf 0.50 | 0.53 (9 TP, 15 FP, 1 FN) |
 | Competition F1, IoU ≥ 0.25, conf 0.75 | 0.48 (8 TP, 15 FP, 2 FN) |
 
-All 15 false positives are **one stationary object**: a fixture on the stadium roofline, detected at the same position in every test image with confidence ≈ 0.85. There are no other false positives, so precision is limited by this single fixed scene element rather than by scattered errors. Suppressing static detections (e.g. a zero-motion filter or a fixed exclusion mask) is the obvious next fix. With only 15 images and 10 drones, these figures have wide uncertainty.
+All 15 false positives are **one stationary object**: a fixture on the stadium roofline, detected at the same position in every test image with confidence ≈ 0.85. There are no other false positives, so precision is limited by this single fixed scene element rather than by scattered errors. With only 15 images and 10 drones, these figures have wide uncertainty.
+
+### 3.3 Full Pipeline on Full-Resolution Frames (Held Out)
+**How the frames map back.** The `drone.v5i` test and validation images turn out to be **unscaled 460×460 crops of the original 1920×1080 P1 frames** at a fixed window (x 730–1190, y 310–770), confirmed by template matching (correlation ≥ 0.993). Roboflow's "resize with centre crop" note does not describe them. So the test labels map back to the original frames with a pure offset, and the complete detection pipeline can be scored at native resolution: only detections inside the labelled window are counted.
+
+**Count accuracy** uses the 43 P1 sample images that appear in no training or validation split, with ground-truth counts from `p1_drone_gt.csv`.
+
+| Pipeline | Competition F1 (IoU ≥ 0.25), conf 0.40 | conf 0.50 | Exact count accuracy (43 images), conf 0.40 |
+| :--- | :---: | :---: | :---: |
+| Before: `clean_image` → YOLO at 640 px | **0.00** (0 of 10 drones) | 0.00 | 62.8% (27/43) |
+| After: YOLO on 320 px raw crops, confirmed by morphology | **0.95** (9 TP, 0 FP, 1 FN) | 0.89 | **90.7%** (39/43) |
+| Alternative: YOLO on the whole raw frame at 1280 px | 0.63 | 0.63 | 86.0% (37/43) |
+
+**Why the old pipeline scored 0.00.** It found none of the held-out drones: dimming everything outside morphological candidates, then shrinking the 1080p frame to 640 px, left the detector with nothing it recognized. In the new pipeline the rooftop fixture disappears, because morphology never confirms it.
+
+Reproduce with:
+```bash
+uv run python scripts/eval_detection_holdout.py --dataset <drone.v5i dir> --full-frames data/p1_test \
+    --counts data/p1_drone_gt.csv --confs 0.4 0.5
+```
+(The "before" row was measured by running the previous commit's own `scripts/detect_images.py`, from a worktree at `839dcdd`, on the same frames.)
 
 ---
 

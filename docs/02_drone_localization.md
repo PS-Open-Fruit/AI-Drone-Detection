@@ -131,7 +131,7 @@ Detections scoring above `soft_thres = 0.25` are ranked, and the top candidates 
 
 The system was evaluated with the project's `evaluate_predictions.py`, which implements the competition's scoring formula, over **459 detections on 413 labeled training images** (`P2_DATA_TRAIN`).
 
-> **Training-set score, not a held-out test.** The GBDT regressors were trained on this same labeled set (the training script holds out only a random 20% of samples), and the evaluator itself labels its output "Competition Criteria, Train Set". The competition's real test set had no public ground truth, so no true test score exists in the archive. Section 5.3 covers the one held-out measurement that was recorded; Section 5.5 gives a cross-validated re-run with this repository.
+> **Training-set score, not a held-out test.** The GBDT regressors were trained on this same labeled set (the training script holds out only a random 20% of samples), and the evaluator itself labels its output "Competition Criteria, Train Set". The competition's real test set had no public ground truth, so no true test score exists in the archive. Section 5.3 covers the one held-out measurement that was recorded. Sections 5.4–5.5 give cross-validated re-runs with this repository, before and after the fixes.
 
 ### 5.1 Comprehensive Performance Metrics
 
@@ -160,10 +160,10 @@ The training script holds out a random 20% of samples (`train_test_split(test_si
 | Longitude | $4.30 \times 10^{-5}$° (≈ 4.6 m) |
 | Altitude | 2.93 m |
 
-These are the only held-out localization numbers in the archive; the competition-formula score on held-out data was never computed. Because the split was random over sequential frames, they are optimistic. Section 5.5 shows that the same kind of split reproduces these MAEs, while holding out contiguous frame ranges roughly triples them.
+These are the only held-out localization numbers in the archive; the competition-formula score on held-out data was never computed. Because the split was random over sequential frames, they are optimistic. Section 5.4 shows that the same kind of split reproduces these MAEs, while holding out contiguous frame ranges roughly triples them.
 
-### 5.5 Cross-Validated Re-Run (This Repository)
-`scripts/cv_localization.py` re-measures localization with this repository's code and shipped detector:
+### 5.4 Cross-Validated Re-Run, Before the Fixes
+`scripts/cv_localization.py` re-measures localization with this repository's code and shipped detector. This section records the pipeline as it was before the fixes in Section 5.5:
 - **Box extraction:** the shipped inference path from `localize_drones.py` (morphology → `clean_image` → YOLO → OSD/foliage filter → adaptive `FusionEngine`), applied identically to training and test images.
 - **Box selection:** one box per image, the highest fused score (no ground truth used).
 - **Models:** scaler and GBDTs refit on the training folds only, with the config hyperparameters.
@@ -192,6 +192,39 @@ Under random folds, a test image's nearest training position is a median 1.7 m a
 - YOLO (on the cleaned image) supplies the chosen box in only 60 of 416 images. The other 356 boxes come from the morphology branch, inflated by the 50×50 dilation (median 63×53 px, against 53×31 px for YOLO boxes).
 - Under random CV, YOLO-box samples score worse (5.17) than morphology-box samples (3.31).
 - The 12 images with two candidate boxes score 8.09, against 3.44 for single-box images.
+
+### 5.5 Fixes and Their Measured Effect
+Diagnosing the run above found five problems:
+1. **Pre-YOLO cleaning blinded the detector.** `clean_image` dims everything outside morphological candidates to 10% brightness, which looks nothing like YOLO's training images.
+2. **The raw frame alone is not the answer.** On the raw frame YOLO fires on static scene objects (the OSD timestamp, the tree line at y ≈ 680–760 px) at 0.45–0.7 confidence in nearly every image.
+3. **Morphology boxes are inflated** by the 50×50 dilation, so the two box sources described drones at different scales.
+4. **`train_gbdt.py` trained on different boxes than inference used.** It took the top raw-YOLO box with no exclusion zones, often the OSD timestamp. It also could not read the competition's per-image label format.
+5. **Raw latitude / longitude / altitude targets** make the trees learn the camera geometry piecewise, which does not carry over to unseen flights.
+
+**The fixes:**
+- `DroneDetector` runs YOLO on native-resolution 320 px crops of the **raw** frame around each morphological candidate, and keeps a YOLO box only if a candidate confirms it.
+- Unconfirmed candidates fall back to tight dark-pixel boxes.
+- Training and inference share this path (`DroneDetector.best_box`).
+- `GeoLocalizer` regresses bearing, log distance and height relative to the camera.
+
+`uv run python scripts/cv_localization.py` on the shipped configuration:
+
+| Protocol (pooled) | Before | **After** |
+| :--- | :---: | :---: |
+| **Blocked 5-fold, all 438 images** (misses scored with a fallback) | 8.84 | **6.96** |
+| Blocked 5-fold, images with a detection | 7.84 (416 images) | **6.36** (422 images) |
+| Random 5-fold, all images | 4.79 | **3.53** |
+| Blocked: mean angle / height / range error | 6.57° / 8.62 m / 19.67 m | **5.15° / 7.78 m / 14.59 m** |
+
+YOLO now supplies a confirmed box in 347 of 438 images (60 before); 75 use tight morphology boxes and 16 have no detection.
+
+**How the configuration was chosen.** Box sources (current; raw full frame at 640 / 1280 px; raw crops of 320 / 480 / 640 px) were crossed with three model formulations: GBDTs on lat/lon/alt, GBDTs on bearing / distance / height, and linear angles with a GBDT distance. Each combination was scored by blocked and random CV on all 438 images.
+- **Bearing / distance / height targets beat lat/lon/alt in every box configuration, on both protocols**, so that choice is robust.
+- **Raw crops beat full-frame YOLO** for localization (blocked 6.8–6.9 against 7.2–7.5). They also win Problem 1 detection and are cheaper on CPU.
+- **Crop size barely matters for localization** (blocked 6.92 / 6.81 / 6.84 for 320 / 480 / 640 px). 320 px was chosen for speed on the Raspberry Pi target.
+- The linear-angle variant scores slightly better on blocked CV (6.60) but worse on random CV (4.48 against 3.53), so it is available (`model_formulation: hybrid`) but not the default.
+
+**Conservative figure:** re-running the *selection itself* inside each fold (nested blocked CV, choosing among all 33 combinations on inner folds only) gives **7.90**. The inner choices flip between combinations whose scores differ by less than their noise, so the shipped configuration's 6.96 carries some selection optimism. The improvement over 8.84 holds under both figures.
 
 ### 5.6 Final Submission Files
 - Generated files: `submission_improved.csv` and `submission2.csv`.

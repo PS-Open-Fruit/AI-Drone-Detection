@@ -38,38 +38,72 @@ graph LR
 ```
 
 ### 1.1 CPU Performance Optimizations
-1. **Lightweight Model Tiering**:
-   - The shipped detector is `yolo11n-obb` (Nano backbone, ~2.65M parameters), which keeps memory and CPU cost low. Its validation and held-out test results are in [01 §3.2](01_object_detection.md); YOLO inference takes about 21 ms per 1080p frame on the desktop CPU in §1.2.
-   - Without YOLO weights, the tracker falls back to morphological candidates only, which avoids neural inference entirely. In the current code, `--fusion seg` still runs YOLO whenever weights are present; skipping it in that mode is a possible optimization.
+1. **Detect only where something is**:
+   - Morphology (threshold + 50×50 dilation, about 6 ms per 1080p frame on the desktop CPU) proposes candidates.
+   - YOLO11n-OBB (~2.65M parameters) then runs only on native-resolution 320 px crops around them (about 15 ms per crop on the desktop CPU), instead of on the whole frame. This is both faster and more accurate than whole-frame inference; see [01 §3.3](01_object_detection.md).
+   - Without YOLO weights the pipeline falls back to morphological candidates only, which avoids neural inference entirely.
 2. **Lightweight Coordinate Estimation**:
-   - The GBDT models (`lat.bin`, `lon.bin`, `alt.bin`) are shallow tree ensembles (200 trees, depth ≤ 5, per coordinate) evaluated on CPU, so the localization stage needs no neural network. Per-target latency on the Raspberry Pi 5 has not been benchmarked.
+   - `geo_localizer.bin` holds three shallow GBDT ensembles (200 trees, depth ≤ 5) for bearing, distance and height, evaluated on CPU in about 1 ms per confirmed track. The localization stage needs no neural network.
+3. **No full-frame float math**:
+   - The previous pre-YOLO `clean_image` step (float32 dimming of the whole frame, 45 ms) is no longer on the detection path. Where it is still used, it now runs as uint8 OpenCV operations.
 
 ### 1.2 Measured Desktop CPU Throughput
-**Setup:** `scripts/benchmark_pipeline.py` times the unmodified tracking pipeline (`config/default.yaml`; plain YOLO11n-OBB at 640 px, no SAHI). It ran on a **desktop Intel Core i5-14500 CPU (Windows 11, no GPU)** over 1080p competition footage (`P1_VIDEO_4`/`P1_VIDEO_5`).
-- **Runs:** 24 timed runs of 600 frames, each in a fresh process, with the first 20 frames excluded as warm-up.
-- **Cross-check:** the plain `track_video.py` agrees within about 2%.
-- **This is not a Raspberry Pi 5 measurement.** On-device speed on the Pi has not been measured.
+**Setup:** `scripts/benchmark_pipeline.py` times the real tracking pipeline (`config/default.yaml`) stage by stage, on a **desktop Intel Core i5-14500 CPU (Windows 11, no GPU)** over 1080p, 25 fps competition footage.
+- **Runs:** each run is a fresh process; the first 20 frames are excluded as warm-up.
+- **Before vs after:** the previous pipeline (commit `839dcdd`, from a git worktree) and the current one ran back to back on the same videos, 2 runs × 600 frames each.
+- **This is not a Raspberry Pi 5 measurement**; see §1.3.
 
-**End-to-end:** ≈ 10 FPS (median 95.7 ms/frame, p95 106 ms). Run medians are 10.2 FPS (`P1_VIDEO_5`) and 10.4 FPS (`P1_VIDEO_4`).
+| Video | Before (`clean_image` → YOLO 640 on the whole frame) | **After** (YOLO on 320 px raw crops around candidates) | Speed-up |
+| :--- | :---: | :---: | :---: |
+| `P1_VIDEO_5` (2 drones) | 90.9 ms/frame (≈ 11 FPS) | **51.6 ms/frame (19.4 FPS)**, p95 56.1 ms | 1.8× |
+| `P1_VIDEO_4` (1 drone) | 87.8 ms/frame (11.4 FPS) | **35.1 ms/frame (28.0 FPS)**, p95 43.9 ms | 2.5× |
 
-| Stage (median ms per frame) | ms | Share |
+| Stage (median ms per frame, `P1_VIDEO_5`) | Before | After |
 | :--- | :---: | :---: |
-| Video decode | 3.4 | 3.6% |
-| Morphology (`ImageProcessor.process`) | 6.6 | 7.0% |
-| **Background cleaning (`clean_image`)** | **47.7** | **50.0%** |
-| YOLO11n-OBB (21.3 ms inference) | 24.5 | 26.0% |
-| Fusion + association + track management | 0.3 | 0.3% |
-| GBDT localization (~1 ms per confirmed track) | 2.1 | 2.3% |
-| HUD render | 1.5 | 1.6% |
-| Video write (mp4v, 1080p) | 8.8 | 9.2% |
+| Video decode | 3.2 | 2.8 |
+| Grayscale + threshold | (inside morphology) | 1.7 |
+| Morphology (`ImageProcessor.process`) | 6.3 | 4.2 |
+| Background cleaning (`clean_image`) | **45.5** | removed from the path |
+| YOLO11n-OBB | 23.9 (one 640 px frame) | 30.6 (two 320 px crops, ≈ 15 ms each) |
+| Tracking, fusion | 0.3 | 0.5 |
+| Localization | 2.1 | 1.9 |
+| HUD render | 1.5 | 1.5 |
+| Video write (mp4v, 1080p) | 8.6 | 8.5 |
 
-**Bottleneck:** the pre-YOLO `clean_image` step, not the neural network. It does full-frame float32 NumPy arithmetic on 1920×1080×3 images in a single thread. Rewriting it with uint8/OpenCV operations is the most promising speed-up, but it hasn't been implemented or measured yet.
-
-**Thread settings:** limiting torch and OpenCV to 4 threads did not change median throughput, but it increased run-to-run variance.
+**Where the time goes now:**
+- YOLO cost scales with the number of morphological candidates, about one crop per drone-like object in view. A sky full of birds or dark clouds costs more than the clean footage measured here.
+- Writing the annotated 1080p video is now about a sixth to a quarter of each frame. It is output overhead, not detection.
 
 **Caveats:**
-- The machine was not fully idle (8–20% background load), and 3 of the 24 runs were visibly disturbed; they are reported, not excluded.
-- Medians varied by about 5% between batches.
+- The machine was not fully idle (mean background load 12% during the "before" runs, 5.5% during the "after" runs).
+- One "before" run on `P1_VIDEO_5` was visibly disturbed (8.3 FPS against 11.2 FPS). The table uses medians pooled over all frames, which are robust to that.
+
+**NCNN backend.** The detector can also be exported to NCNN, the fastest CPU backend Ultralytics supports on ARM. On the held-out detection set the NCNN export gives identical results (F1 0.947, 39/43 counts). On this x86 desktop it is about as fast as PyTorch (13.5 vs 14.3 ms per 320 px crop); its advantage is expected on the Pi's ARM cores, and §1.3 measures that.
+
+### 1.3 Measuring on a Raspberry Pi 5
+These steps reproduce the benchmark on the target board. Use Raspberry Pi OS 64-bit and an active cooler: without one, the Pi 5 throttles under sustained load. The benchmark records the SoC temperature and `vcgencmd get_throttled` before and after the runs, so a throttled result is visible in the JSON.
+
+```bash
+# On the Pi
+curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone <this repository> && cd AI-Drone-Detection   # check out the branch being measured
+uv sync --extra edge
+
+# From the PC: copy the detector, the trained localizer and one test video (not in git)
+scp models/yolo11n-obb.pt models/geo_localizer.bin <user>@<pi>:~/AI-Drone-Detection/models/
+scp data/p3_video/P1_VIDEO_5.mp4 <user>@<pi>:~/AI-Drone-Detection/data/p3_video/
+
+# On the Pi: export the detector to NCNN once (320 px input = the crop size)
+uv run python -c "from ultralytics import YOLO; YOLO('models/yolo11n-obb.pt').export(format='ncnn', imgsz=320)"
+
+# Benchmark both backends (300 frames, 2 runs each)
+uv run python scripts/benchmark_pipeline.py data/p3_video/P1_VIDEO_5.mp4 --max-frames 300 \
+    --threads default --repeats 2 --output data/bench_pi_torch.json
+uv run python scripts/benchmark_pipeline.py data/p3_video/P1_VIDEO_5.mp4 --max-frames 300 \
+    --threads default --repeats 2 --yolo-model models/yolo11n-obb_ncnn_model --output data/bench_pi_ncnn.json
+```
+
+Expect video decode and video write to cost far more than on the desktop. The Pi 5 has no hardware H.264 decoder, so 1080p H.264 is decoded on the CPU.
 
 ---
 

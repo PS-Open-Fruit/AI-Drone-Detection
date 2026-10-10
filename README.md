@@ -6,13 +6,19 @@
 [![Platform](https://img.shields.io/badge/Edge-Raspberry%20Pi%205-red.svg)](https://www.raspberrypi.com/)
 [![Tests](https://img.shields.io/badge/Tests-Pytest%20Passing-brightgreen.svg)](tests/)
 
-A drone detection, geolocation, and multi-object tracking pipeline built for the **TESA Top Gun Rally 2025 – Defensive Track** (11–13 Nov 2025). It combines classical morphological target extraction with YOLO11 Oriented Bounding Box (OBB) detection, fuses the two candidate sets, tracks drones across video frames, estimates each confirmed drone's latitude, longitude, and altitude from its image geometry with gradient-boosted decision trees (GBDT), and renders a HUD overlay plus a First Alert telemetry payload. The design targets CPU-only edge hardware (Raspberry Pi 5, no AI accelerator).
+A drone detection, geolocation, and multi-object tracking pipeline built for the **TESA Top Gun Rally 2025 – Defensive Track** (11–13 Nov 2025):
+- **Detection:** cheap morphological target extraction proposes candidates, and YOLO11 Oriented Bounding Box (OBB) detection on native-resolution crops of the raw frame confirms them.
+- **Tracking:** drones are tracked across video frames.
+- **Localization:** each confirmed drone's latitude, longitude, and altitude are estimated from its image geometry with gradient-boosted decision trees (GBDT).
+- **Output:** a HUD overlay plus a First Alert telemetry payload.
 
-This repository is a cleaned-up, unit-tested reimplementation of the original competition code. [Results](#results) states where each figure comes from and what it was evaluated on.
+The design targets CPU-only edge hardware (Raspberry Pi 5, no AI accelerator).
 
-![Two drones tracked over a cloudy sky: each has a coloured box, a persistent track ID and a live panel showing fusion score, estimated latitude, longitude and altitude](docs/assets/demo_tracking.gif)
+This repository is a cleaned-up, unit-tested reimplementation of the original competition code, with the detection and localization bugs found during evaluation fixed. [Results](#results) states where each figure comes from and what it was evaluated on.
 
-*Unedited pipeline output on competition footage (`P1_VIDEO_5`, 8 s, cropped and scaled 0.9×; overlays untouched): both drones keep IDs 1 and 2 throughout. Elsewhere in the footage, birds and other specks occasionally produce short-lived false tracks.*
+![Two drones tracked over a cloudy sky: each has a coloured box, a persistent track ID and a live panel showing confidence, estimated latitude, longitude and altitude](docs/assets/demo_tracking.gif)
+
+*Unedited pipeline output on competition footage (`P1_VIDEO_5`, 8 s, cropped and scaled 0.9×; overlays untouched). Both drones keep IDs 1 and 2 for the whole 69 s video, with no false tracks.*
 
 ---
 
@@ -20,12 +26,13 @@ This repository is a cleaned-up, unit-tested reimplementation of the original co
 
 ```mermaid
 flowchart LR
-    A["Camera Stream\n(Raw Frames)"] --> B["Detection\n(Morphology + YOLO11-OBB)"]
-    B --> C["Candidate Fusion\n(IoU + Shape + Motion)"]
-    C --> D["Tracking\n(Greedy Association)"]
-    D --> E["Localization\n(GBDT on Confirmed Tracks)"]
-    E --> F["HUD Overlay\n(Annotated Video)"]
-    E --> G["First Alert Payload\n(Optional HTTP POST)"]
+    A["Camera Stream\n(Raw Frames)"] --> B["Morphology\n(Candidate Proposals)"]
+    B --> C["YOLO11-OBB on Raw Crops\n(Confirms Candidates)"]
+    C --> D["Candidate Fusion\n(IoU + Shape + Motion)"]
+    D --> E["Tracking\n(Greedy Association)"]
+    E --> F["Localization\n(GBDT on Confirmed Tracks)"]
+    F --> G["HUD Overlay\n(Annotated Video)"]
+    F --> H["First Alert Payload\n(Optional HTTP POST)"]
 ```
 
 ---
@@ -35,10 +42,21 @@ flowchart LR
 ![5-Stage Defense Processing Pipeline](docs/assets/real_drone_pipeline_5_stages.jpg)
 
 1. **Stage 1 (Raw Input)**: Full-resolution frame from the fixed ground-station camera.
-2. **Stage 2 (Binarization & Morphology)**: Grayscale thresholding separates bright sky from dark targets; the mask is inverted, dilated with a 50×50 kernel to merge fragmented rotor blobs, then eroded and closed before contours are area-gated.
-3. **Stage 3 (Detection & Fusion)**: YOLO11-OBB runs on a copy of the frame with the background dimmed and the OSD timestamp banner and foliage band masked out; its boxes are fused with the morphological candidates using IoU, shape-plausibility, and motion scores.
-4. **Stage 4 (Multi-Object Tracking)**: Greedy nearest-centroid association. A track is confirmed after 3 matched detections and kept alive through up to 30 missed frames, so IDs can survive short dropouts.
-5. **Stage 5 (HUD & Localization)**: Confirmed tracks get GBDT-estimated latitude, longitude, and altitude (MSL), drawn on the output video with the track ID and its fusion score (a heuristic 0–1 score from Stage 3, not a calibrated detector probability).
+2. **Stage 2 (Binarization & Morphology)**:
+   - Grayscale thresholding separates bright sky from dark targets.
+   - A 50×50 dilation merges fragmented rotor blobs, then erosion and closing clean the mask.
+   - Contours are area-gated and the OSD timestamp banner and foliage band are excluded.
+   - Each candidate also gets a **tight box** (its dark-pixel extent) for localization.
+3. **Stage 3 (Detection & Fusion)**:
+   - YOLO11-OBB runs on native-resolution 320 px crops of the **raw** frame around each candidate.
+   - A YOLO box is kept only if a morphological candidate confirms it, which removes static scene objects (timestamp text, tree line, a stadium roof fixture) that the detector scores at 0.45–0.9 in every frame.
+   - Confirmed boxes and candidates are fused using IoU, shape-plausibility, and motion scores.
+4. **Stage 4 (Multi-Object Tracking)**: Greedy nearest-centroid association.
+   - Only a YOLO-confirmed detection can **start** a track; morphology alone can extend one.
+   - A track is confirmed after 3 matched detections and kept alive through up to 30 missed frames.
+5. **Stage 5 (HUD & Localization)**: Confirmed tracks get estimated latitude, longitude, and altitude (MSL), drawn on the output video with the track ID and its fusion score.
+   - The localizer regresses camera-centric bearing, distance, and height, then converts them to latitude, longitude, and altitude.
+   - For YOLO boxes the fusion score is the YOLO confidence, plus 0.10 when morphology agrees. Morphology-only boxes show a heuristic shape/motion score. Neither is a calibrated probability.
 
 ---
 
@@ -50,8 +68,9 @@ All environments and dependencies are managed via [`uv`](https://github.com/astr
 # 1. Clone repository and initialize virtual environment
 uv sync --extra dev
 
-# 2. Review model setup instructions
-# (See models/README.md for downloading or training models)
+# 2. Put the detector at models/yolo11n-obb.pt and train the localizer
+#    (see models/README.md)
+uv run python scripts/train_gbdt.py --data data/p2_train
 
 # 3. Run video tracking
 uv run python scripts/track_video.py input.mp4 -o output_tracked.mp4
@@ -66,34 +85,45 @@ uv run pytest tests/ -v
 
 | Module | Core Scripts | Description |
 | :--- | :--- | :--- |
-| **1. Detection** | [`scripts/detect_images.py`](scripts/detect_images.py)<br>[`scripts/tune_confidence.py`](scripts/tune_confidence.py) | Morphological candidate extraction + YOLO11-OBB inference, optional SAHI sliced inference for small targets, and a confidence-threshold sweep tool. |
-| **2. Localization** | [`scripts/localize_drones.py`](scripts/localize_drones.py)<br>[`scripts/train_gbdt.py`](scripts/train_gbdt.py) | 20-dimensional image-geometry features (normalized position, box size and aspect, radial/polar terms, corner distances) fed to 3 independent GBDT regressors for latitude, longitude, and altitude. |
+| **1. Detection** | [`scripts/detect_images.py`](scripts/detect_images.py)<br>[`scripts/tune_confidence.py`](scripts/tune_confidence.py) | `DroneDetector`: morphological candidates confirmed by YOLO11-OBB on raw-frame crops (or the whole frame, configurable). It is the single detection path used by every script. Optional SAHI sliced inference and a confidence-threshold sweep tool. |
+| **2. Localization** | [`scripts/localize_drones.py`](scripts/localize_drones.py)<br>[`scripts/train_gbdt.py`](scripts/train_gbdt.py) | `GeoLocalizer`: 20-dimensional image-geometry features (normalized position, box size and aspect, radial/polar terms, corner distances) feed GBDTs for bearing, distance, and height relative to the camera, converted to latitude, longitude, and altitude. Training uses the same detection path as inference. |
 | **3. Tracking & Telemetry** | [`scripts/track_video.py`](scripts/track_video.py)<br>[`scripts/generate_submission.py`](scripts/generate_submission.py) | Stateful multi-target tracking, HUD overlay rendering, and a First Alert JSON payload builder (Base64 frame + per-track coordinates) with optional HTTP POST dispatch, disabled by default. |
 
 ---
 
 ## Results
 
-> **Where these numbers come from.** Rows marked *archived* are recovered from the logs of the original competition runs (November 2025) and were produced by the original code. Rows marked *re-run* were measured with this repository's code and shipped weights. Official competition scores were computed on a private test set (no public leaderboard) and are not part of the archive.
+> **Where these numbers come from.** Every "before / after" pair was measured with this repository's evaluation scripts on the same data. "Before" is the pipeline at commit `839dcdd`; "after" is the current code. Official competition scores were computed on a private test set (no public leaderboard) and are not available.
 
-| Area | Metric | Result | Evaluated on |
-| :--- | :--- | :--- | :--- |
-| **Detection, held out** (*re-run*): shipped YOLO11n-OBB, `models/yolo11n-obb.pt` | mAP@50; competition F1 (IoU ≥ 0.25) | **72.5%**; F1 **0.53** at conf 0.50 (recall 90%, precision 38%) | 15 test images (10 drones) of the `drone.v5i` Roboflow dataset, never used in training; raw detector on 460×460 crops. All 15 false positives are one stationary rooftop fixture, flagged in every image; there are no others. Reproduce with `uv run python scripts/eval_detection_holdout.py --dataset <drone.v5i dir>` (dataset from the competition archive) |
-| **Detection, validation** (*archived*): same model (`best.pt`, epoch 74) | mAP@50 / mAP@50-95 | 99.5% / 85.3% (precision 100%, recall 99.4%) | 21-image validation split used for checkpoint selection; 5 of its frames are interleaved with training frames of the same video |
-| **Drone counting** (*archived*): SAHI + YOLO11-OBB | Exact per-image count accuracy | **77.08%** (74/96 images), count RMSE 0.568 | 96 labeled sample images. Best point of a confidence sweep (conf = 0.75) chosen on the same images. The checkpoint used isn't recorded, and 19 of the images are in the `drone.v3`/`drone.v4` training split |
-| **Localization, held out** (*re-run*): shipped inference path, GBDTs refit per fold | Competition weighted error (0.70 × angle + 0.15 × height + 0.15 × range; lower is better) | **7.8** under blocked 5-fold CV (mean angle 5.3°, height 8.6 m, range 18.8 m); 3.6 under random 5-fold | 416 of 438 labeled images (22 had no detection). The images are consecutive frames of 4–5 flights, so blocked CV, which holds out contiguous frame ranges, is the honest estimate. Random folds mostly test interpolation between near-duplicate neighbouring frames. Reproduce with `uv run python scripts/cv_localization.py` |
-| **Throughput** (*re-run*): full tracking pipeline, default config | End-to-end frames per second on 1080p video | **≈ 10 FPS** (10.2–10.4 median across runs; 95.7 ms/frame median, 106 ms p95) | Desktop Intel Core i5-14500 CPU, Windows 11, no GPU. Measured on `P1_VIDEO_4`/`P1_VIDEO_5`, 24 timed runs of 600 frames each. About half of each frame is the pre-YOLO `clean_image` step (48 ms), against 24 ms for YOLO11n-OBB. **Not a Raspberry Pi measurement.** Reproduce with `uv run python scripts/benchmark_pipeline.py <videos>` |
+| Area | Metric (held out) | Before | **After** | Evaluated on |
+| :--- | :--- | :---: | :---: | :--- |
+| **Drone detection** (Problem 1) | Competition F1, IoU ≥ 0.25 | 0.00 (0 of 10 drones) | **0.95** (9 TP, 0 FP, 1 FN) | 15 full-resolution frames whose labels (`drone.v5i` test split) were never used in training. `scripts/eval_detection_holdout.py --full-frames` |
+| **Drone counting** (Problem 1) | Exact per-image count accuracy | 62.8% (27/43) | **90.7%** (39/43) | 43 labeled sample images in no training or validation split |
+| **Localization** (Problem 2) | Competition weighted error (0.70 × angle + 0.15 × height + 0.15 × range; lower is better) | 8.84 | **6.96** (angle 5.2°, height 7.8 m, range 14.6 m) | Blocked 5-fold CV over all 438 labeled images; misses scored with a fallback. `scripts/cv_localization.py` |
+| **Tracking** (Problem 3) | False tracks / frames showing a wrong drone count | 9 / 21.2% (`P1_VIDEO_4`)<br>3 / 7.7% (`P1_VIDEO_5`) | **2 / 5.2%**<br>**0 / 0.0%** | Full competition videos with 1 and 2 drones (manually verified constant). Real drones stay tracked in 100% of frames in both versions |
+| **Throughput** | End-to-end FPS, 1080p video | 11.0–11.4 FPS | **19.4–28.0 FPS** | Desktop Intel Core i5-14500 CPU, no GPU, same videos back to back. **Not a Raspberry Pi measurement.** `scripts/benchmark_pipeline.py` |
 
-The archive's localization figures (3.33 weighted error; 2.93 m altitude MAE) are a training-set score and a random split over the same sequential frames, so they are optimistic. See [`docs/02_drone_localization.md`](docs/02_drone_localization.md) §5.
+**What changed:**
+- **The detector no longer runs on a dimmed copy of the frame.** The old pre-YOLO cleaning step blinded it: on the held-out frames it found none of the drones.
+- **YOLO runs on raw crops and must be confirmed by morphology**, which removes static false positives.
+- **Training and inference now share one box-extraction path.** `train_gbdt.py` used to train on different boxes than inference, often the camera's timestamp text, and could not read the competition's label format.
+- **The localizer predicts camera-centric quantities** instead of raw latitude, longitude, and altitude.
+- **Bird- and speck-like blobs can no longer start a track** on their own.
 
-**Pipeline behaviour worth knowing:** on the localization images, YOLO fires on the cleaned frame in only 60 of 438 images. 86% of the boxes used for localization come from the morphology branch, whose 50×50 dilation inflates box size. On video, boxes switch between tight YOLO boxes and loose morphology boxes, which makes the altitude readout jitter.
+Details, ablations, and caveats are in [`docs/01_object_detection.md`](docs/01_object_detection.md) §3, [`docs/02_drone_localization.md`](docs/02_drone_localization.md) §5, [`docs/03_drone_tracking.md`](docs/03_drone_tracking.md) §7 and [`docs/04_edge_deployment.md`](docs/04_edge_deployment.md) §1.2.
 
-**Not quantitatively evaluated:** no tracking ground truth was available, so ID switches, MOTA, and IDF1 are not reported. Qualitatively, in the two competition videos reviewed (`P1_VIDEO_4` and `P1_VIDEO_5`, about 2 minutes), every real drone kept its ID; the drones never crossed paths. Birds and other specks produced false tracks: 9 confirmed false tracks in `P1_VIDEO_4`'s 64 s, with at least one false box in about 21% of its frames. On-device throughput and latency on the Raspberry Pi 5 have not been benchmarked. In the First Alert payload, `velocity_mps` and `direction_deg` are not computed yet and are sent as `null`.
-
-Per-run training tables, the full confidence sweep, and error distributions are in [`docs/01_object_detection.md`](docs/01_object_detection.md) and [`docs/02_drone_localization.md`](docs/02_drone_localization.md).
+**Read these numbers with their limits:**
+- **Small samples.** The detection test set is 15 frames with 10 drones, and the tracking comparison covers two videos with no crossing drones. These show large, consistent effects, but the confidence intervals are wide.
+- **Localization configuration choice.** The configuration was chosen with the same cross-validation it is scored on. Re-running that choice inside every fold (nested CV) gives 7.90, still better than 8.84 (docs/02 §5.5).
+- **Why blocked CV is the headline.** The localization images are consecutive frames of 4–5 flights, so blocked CV holds out whole flight segments. Random 5-fold CV gives 3.53 (was 4.79) but mostly measures interpolation between near-duplicate frames.
+- **Not measured:**
+  - ID switches, MOTA, and IDF1 (no tracking ground truth).
+  - Speed on the Raspberry Pi 5. Step-by-step instructions for measuring it, including the NCNN backend, are in [`docs/04_edge_deployment.md`](docs/04_edge_deployment.md) §1.3.
+  - The First Alert payload's `velocity_mps` and `direction_deg`, which are not computed yet and are sent as `null`.
+- **Archive figures are optimistic.** The original competition archive reports a 3.33 localization error and a 2.93 m altitude error. Those are a training-set score and a random split over sequential frames (docs/02 §5.1–5.3).
 
 **Hardware:**
-- **Deployment target**: Raspberry Pi 5 (ARM Cortex-A76 CPU, 4GB/8GB RAM, no dedicated GPU or AI accelerator). The nano detector and tree-based regressors were chosen for this budget.
+- **Deployment target**: Raspberry Pi 5 (ARM Cortex-A76 CPU, 4GB/8GB RAM, no dedicated GPU or AI accelerator). The nano detector, crop-based inference, and tree-based regressors were chosen for this budget.
 - **Training**: CUDA GPU.
 
 ---
@@ -114,6 +144,7 @@ AI-Drone-Detection/
 │   ├── config.py                       # YAML configuration loader
 │   ├── detection/
 │   │   ├── __init__.py
+│   │   ├── drone_detector.py           # Shared detection path (morphology + confirmed YOLO crops)
 │   │   ├── image_processor.py          # Classical morphological CV pipeline
 │   │   ├── yolo_detector.py            # YOLO11-OBB inference wrapper
 │   │   ├── sahi_detector.py            # Slicing Aided Hyper Inference
@@ -121,7 +152,9 @@ AI-Drone-Detection/
 │   ├── localization/
 │   │   ├── __init__.py
 │   │   ├── feature_encoder.py          # 20-dim spatial feature encoder
-│   │   ├── gbdt_regressor.py           # Multi-target GBDT regressor (lat, lon, alt)
+│   │   ├── geo_localizer.py            # Camera-centric GBDT localizer (bearing, distance, height)
+│   │   ├── dataset.py                  # Labeled-image loading + shared training-sample extraction
+│   │   ├── gbdt_regressor.py           # Previous lat/lon/alt GBDT regressor (kept for reference)
 │   │   ├── fusion_engine.py            # YOLO + morphology candidate fusion
 │   │   └── evaluation.py               # Competition evaluation metrics
 │   ├── tracking/
@@ -140,11 +173,11 @@ AI-Drone-Detection/
 │   ├── detect_images.py                # Problem 1: Batch image detection
 │   ├── localize_drones.py              # Problem 2: Full localization pipeline
 │   ├── track_video.py                  # Problem 3: Video tracking with HUD
-│   ├── train_gbdt.py                   # GBDT training script
+│   ├── train_gbdt.py                   # Localizer training script
 │   ├── tune_confidence.py              # Confidence threshold optimization
 │   ├── prepare_dataset.py              # Video-to-YOLO dataset creator
 │   ├── generate_submission.py          # Competition CSV submission formatter
-│   ├── eval_detection_holdout.py       # Held-out detection eval (mAP + competition F1)
+│   ├── eval_detection_holdout.py       # Held-out detection eval (raw model + full pipeline)
 │   ├── cv_localization.py              # Cross-validated localization evaluation
 │   └── benchmark_pipeline.py           # Per-stage CPU throughput benchmark
 ├── notebooks/
@@ -160,10 +193,12 @@ AI-Drone-Detection/
 │   ├── architecture.md
 │   └── assets/                         # Visual artifacts and charts
 ├── tests/
+│   ├── test_drone_detector.py
 │   ├── test_drone_track.py
 │   ├── test_feature_encoder.py
 │   ├── test_fusion_engine.py
 │   ├── test_gbdt_regressor.py
+│   ├── test_geo_localizer.py
 │   ├── test_geometry.py
 │   ├── test_image_processor.py
 │   └── test_tracker.py

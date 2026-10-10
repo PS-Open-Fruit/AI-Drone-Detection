@@ -11,10 +11,9 @@ When the system is fully populated, the following files should be located in thi
 | Filename | Description | Architecture / Model |
 | :--- | :--- | :--- |
 | `yolo11n-obb.pt` | YOLO11 Nano Oriented Bounding Box detector weights | Ultralytics YOLO11n-OBB |
-| `lat.bin` | Latitude regressor model | scikit-learn GradientBoostingRegressor |
-| `lon.bin` | Longitude regressor model | scikit-learn GradientBoostingRegressor |
-| `alt.bin` | Altitude MSL regressor model | scikit-learn GradientBoostingRegressor |
-| `scaler.bin` | Fitted StandardScaler for 20-dim feature vector | scikit-learn StandardScaler |
+| `geo_localizer.bin` | Drone geo-localizer: bearing, log horizontal distance and height relative to the camera, converted to latitude / longitude / altitude MSL | `defense.localization.GeoLocalizer` (3 scikit-learn GradientBoostingRegressors) |
+
+`lat.bin`, `lon.bin`, `alt.bin` and `scaler.bin` are from the previous `GBDTRegressor` format and are no longer loaded by the pipeline.
 
 ---
 
@@ -29,11 +28,15 @@ When the system is fully populated, the following files should be located in thi
 3. Copy the resulting `best.pt` file to:
    `models/yolo11n-obb.pt`
 
-### B. GBDT Geo-Localization Models
-To train the Latitude, Longitude, and Altitude regressors from a dataset with paired image coordinates and ground-truth GNSS labels:
+### B. Geo-Localizer
+Train from the competition's Problem 2 data: a directory of `img_XXXX.jpg` + `img_XXXX.csv` pairs, where each CSV holds the drone's ground-truth `Latitude, Longitude, Altitude`:
 
 ```bash
-uv run python scripts/train_gbdt.py --data path/to/dataset/ --out models/
+uv run python scripts/train_gbdt.py --data data/p2_train
 ```
 
-This will automatically train the three regressors and fit `scaler.bin`, saving them directly to `models/`.
+Training boxes come from the same detection path used at inference (`DroneDetector.best_box`), so the YOLO weights above must be in place first. This writes `models/geo_localizer.bin`. The training fit is not an accuracy measure; for a held-out score, run:
+
+```bash
+uv run python scripts/cv_localization.py
+```

@@ -149,3 +149,28 @@ debug_dir/
 To satisfy the **$\le 200\text{ MB}$** competition file constraint:
 - Output frames are written using OpenCV `VideoWriter` with `mp4v` (MPEG-4 Part 2) encoding matching the native video framerate.
 - Densely populated sequences (e.g. 3,600 frames at 30 FPS $\approx 2\text{ minutes}$) compile to approximately $45\text{ MB}$ to $85\text{ MB}$, well within the $200\text{ MB}$ ceiling while preserving razor-sharp text legibility on all telemetry readouts.
+
+---
+
+## 7. Measured Tracking Behaviour (This Repository, Before / After the Detection Fixes)
+
+No tracking ground truth exists, so ID switches, MOTA and IDF1 cannot be computed. Manual review established that `P1_VIDEO_5` shows exactly **two** drones for its whole length and `P1_VIDEO_4` exactly **one**, and the drones never cross paths. That supports these proxy measures over every frame after the first 10:
+- **False tracks:** confirmed track IDs beyond the true drone count.
+- **Wrong-count frames:** frames where the number of boxes drawn differs from the true count.
+- **Box flicker:** the share of frames where a drone's box area jumps more than 1.5× from the previous frame.
+
+| Video | Pipeline | False tracks | Wrong-count frames | Real drones tracked (live) | Box flicker |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| `P1_VIDEO_5` (2 drones, 1,736 frames) | before | 3 | 7.7% | 100% / 100% | 13.7% / 19.5% |
+| | **after** | **0** | **0.0%** | 100% / 100% | **3.3% / 2.2%** |
+| `P1_VIDEO_4` (1 drone, 1,597 frames) | before | 9 | 21.2% | 100% | 1.0% |
+| | **after** | **2** | **5.2%** | 100% | 2.1% |
+
+"Before" is the pipeline at commit `839dcdd`: `clean_image` → YOLO at 640 px, with any shape-plausible morphology blob allowed to start a track. "After" makes three changes:
+- YOLO runs on raw-frame crops, and its boxes must be confirmed by morphology.
+- Morphology-only candidates use tight boxes.
+- New tracks require a YOLO detection (`tracking.require_yolo_for_new_tracks`).
+
+In both runs the main tracks follow the same objects: a median 1.4–2.1 px between the before and after track centres.
+
+The two remaining false tracks in `P1_VIDEO_4` were started by YOLO detections at 0.50 and 0.64 confidence, while real drones started at 0.84–0.95. A separate, higher threshold for starting tracks would likely remove them, but it was not tuned here because these two videos are the only evaluation material.
