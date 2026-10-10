@@ -20,6 +20,21 @@ class FusionEngine:
         log("Fusion", f"Initialized: mode={mode}, weights=(IoU={iou_weight}, "
                        f"Shape={shape_weight}, Motion={motion_weight}), threshold={soft_threshold}")
 
+    @classmethod
+    def from_config(cls, loc_cfg: dict, mode: str = None) -> "FusionEngine":
+        """Build from the `localization` config section (mode overrides fusion_mode)."""
+        return cls(
+            mode=mode or loc_cfg.get("fusion_mode", "adaptive"),
+            iou_weight=loc_cfg.get("iou_weight", 0.60),
+            shape_weight=loc_cfg.get("shape_weight", 0.30),
+            motion_weight=loc_cfg.get("motion_weight", 0.10),
+            soft_threshold=loc_cfg.get("soft_threshold", 0.25),
+            area_ratio_min=loc_cfg.get("area_ratio_min", 0.00005),
+            area_ratio_max=loc_cfg.get("area_ratio_max", 0.003),
+            aspect_ratio_min=loc_cfg.get("aspect_ratio_min", 0.4),
+            aspect_ratio_max=loc_cfg.get("aspect_ratio_max", 3.0),
+        )
+
     def score_candidate(self, candidate_box, yolo_detections, prev_centroids, image_shape) -> float:
         """
         Compute fusion score for a single candidate box.
@@ -173,6 +188,7 @@ class FusionEngine:
             "height": int(round(h)),
             "confidence": float(conf),
             "polygon": None,
+            "source": "seg",
         }
 
     def _get_centroid(self, box) -> tuple[float, float]:
