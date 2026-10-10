@@ -308,12 +308,15 @@ def _git(*args) -> str:
 
 
 def _sha256(path: Path) -> str:
+    """File hash; for a model directory (e.g. an NCNN export) the hash covers every file in sorted order."""
     if not path.exists():
         return ""
+    files = sorted(p for p in path.rglob("*") if p.is_file()) if path.is_dir() else [path]
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
+    for fp in files:
+        with open(fp, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
     return h.hexdigest()
 
 
@@ -439,8 +442,13 @@ def benchmark_once(args) -> dict:
     drone_detector = build_drone_detector(det_cfg, yolo_path=yolo_path)
     detector = drone_detector.yolo
     yolo_load_ms = (time.perf_counter() - t0) * 1e3
-    # Count parameters before the first predict fuses Conv+BN in place.
-    yolo_params = int(sum(p.numel() for p in detector.model.model.parameters())) if detector else 0
+    # Count parameters before the first predict fuses Conv+BN in place (PyTorch weights only; exported
+    # formats such as NCNN have no torch module, so the count is recorded as None).
+    try:
+        yolo_params = int(sum(p.numel() for p in detector.model.model.parameters())) if detector else 0
+    except AttributeError:
+        yolo_params = None
+    yolo_backend = "ncnn" if detector and str(yolo_path).rstrip("/\\").endswith("_ncnn_model") else "pytorch"
 
     t0 = time.perf_counter()
     localizer = None
@@ -588,6 +596,7 @@ def benchmark_once(args) -> dict:
             "yolo_model": yolo_path,
             "yolo_model_sha256": _sha256(Path(yolo_path)),
             "yolo_params": yolo_params,
+            "yolo_backend": yolo_backend,
             "yolo_input": yolo_input,
             "confidence": confidence,
             "device": det_cfg.get("device", "cpu"),
