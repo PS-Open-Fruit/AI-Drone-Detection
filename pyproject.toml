@@ -22,6 +22,10 @@ dependencies = [
 dev = [
     "pytest>=7.0",
 ]
+# NCNN runtime for the exported YOLO model (fastest CPU backend on Raspberry Pi / ARM)
+edge = [
+    "ncnn>=1.0.20260526",
+]
 
 [project.scripts]
 defense-detect = "scripts.detect_images:main"
